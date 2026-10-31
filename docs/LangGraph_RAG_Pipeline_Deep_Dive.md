@@ -1,19 +1,19 @@
-# LangGraph RAG Pipeline Deep Dive
+# How DocuMind Answers Questions
 
-## Technical map, worked examples, edge cases, and code review
+## LangGraph flow, examples, errors, and improvement notes
 
 **Project:** DocuMind — Technical Documentation Assistant  
 **Repository:** DS-Intern Assignment  
 **Prepared:** 2026-10-31  
-**Purpose:** Explain the implementation in enough detail to debug it, verify its behavior, and plan improvements.
+**Purpose:** A practical guide for understanding, debugging, and improving the question-answering pipeline.
 
-> This guide describes the repository as inspected for this review. It distinguishes the LangGraph itself from the feedback-memory shortcut and the FastAPI/SSE wrapper, because those execute before and around the graph.
+> This guide describes the current code. A question can be answered by the feedback-memory shortcut before it reaches LangGraph. FastAPI starts the request, and the frontend uses SSE to receive progress and answer text while the request runs.
 
 ## Contents
 
 1. Executive summary and architecture
 2. Request lifecycle outside and inside the graph
-3. Graph topology, nodes, and conditional edges
+3. Graph flow, steps, and branch rules
 4. RAGState field reference
 5. Worked traces and edge cases
 6. Feedback memory and cached-answer rules
@@ -23,11 +23,23 @@
 10. Review findings and improvement roadmap
 11. Test results and source map
 
+## Quick terms
+
+- **RAG:** Search the documentation first, then ask a model to write from the search results.
+- **Chunk:** A smaller piece of an indexed document. The assistant retrieves and cites chunks rather than whole files.
+- **Embedding:** A list of numbers representing the meaning of text. Similar questions usually have embeddings that point in similar directions.
+- **Vector ID:** The FAISS index's numeric ID for a chunk. Metadata maps that ID back to the document and text.
+- **Node:** One step in the graph, implemented as a Python function.
+- **Edge:** A connection that says which node runs next. A conditional edge chooses based on the current state.
+- **State:** The data carried between nodes for one question, such as the query, retrieved chunks, retries, and draft answer.
+- **Judge/evaluator:** The configured model that checks retrieved chunks or scores an answer against evidence.
+- **SSE:** A web connection that sends progress and text events from the server as they happen.
+
 ## 1. Executive summary and architecture
 
-DocuMind is a retrieval-augmented generation (RAG) assistant. It searches locally indexed documentation, asks a judge model to select relevant chunks, asks a generation model to draft from those chunks, then asks a judge model to score that draft against the evidence. The graph returns a passed answer only when configured score gates are met. It allows a bounded retry to rewrite a search query when no chunks are relevant and one regeneration when answer evaluation fails.
+DocuMind is a retrieval-augmented generation (RAG) assistant. It searches indexed documentation, asks an evaluation model to select useful chunks, asks a generation model to draft from those chunks, then asks the evaluator to compare the draft with the evidence. The graph returns a passed answer only when the minimum score rules are met. It can rewrite the search up to a configured limit when no chunks are useful, and it can regenerate a failed draft once.
 
-A feedback-memory check runs before the graph. It can report similar previous questions, reuse a sufficiently supported upvoted answer, synthesize several upvoted answers against still-current cited chunks, or suppress an answer after consecutive strong downvotes while the corpus snapshot is unchanged.
+A feedback-memory check runs before the graph. It can show similar previous questions, reuse a well-supported upvoted answer, combine several upvoted answers using their current source chunks, or return an insufficient-evidence response after consecutive strong downvotes while the indexed documents have not changed.
 
 ```text
 POST /query
@@ -48,7 +60,7 @@ POST /query
                                   └─ operational error → safe_response
 ```
 
-LangGraph contributes the explicit node and edge routing. Nodes are ordinary Python functions that read state and return partial state updates. The progress callback is a side channel for UI events, not durable graph state. The compiled StateGraph controls which node runs next.
+LangGraph makes the step order and branches explicit. Each node is a Python function that reads the current state and returns changes to it. Progress events sent to the UI are separate from that state; they explain what the backend is doing but do not affect the graph's decisions.
 
 **Source map:** graph and memory logic are in `retrieval/service.py`; state schema in `retrieval/models.py`; model transport/fallback in `retrieval/llm.py`; prompts in `retrieval/prompts.py`; FastAPI and SSE framing in `app.py`; conversation and feedback persistence in `retrieval/store.py`.
 
@@ -65,7 +77,7 @@ LangGraph contributes the explicit node and edge routing. Nodes are ordinary Pyt
 
 Both `query()` and `query_stream()` call `_feedback_shortcut()` before building or invoking the graph. A direct cached response therefore skips query rewriting, FAISS retrieval, chunk grading, normal generation, and sometimes answer evaluation. The multiple-answer synthesis route still generates and evaluates.
 
-The matcher compares the query embedding to saved feedback embeddings and embeddings of up to 100 recent distinct conversation questions. Candidate/display matching uses cosine threshold `FEEDBACK_SIMILARITY_THRESHOLD` (default 0.80). A stricter `FEEDBACK_DIRECT_SIMILARITY_THRESHOLD` (default 0.93) gates direct high-confidence feedback actions. Only feedback-backed entries with current sources can influence reuse or downvote suppression.
+The matcher compares the question's embedding with saved feedback embeddings and up to 100 recent distinct questions. It uses cosine similarity, a measure of how close two embeddings are. The match threshold is `FEEDBACK_SIMILARITY_THRESHOLD` (default 0.80). Direct feedback actions use the stricter `FEEDBACK_DIRECT_SIMILARITY_THRESHOLD` (default 0.93). Only feedback entries with current sources can affect answer reuse or downvote handling.
 
 > **Memory display versus answer shortcut:** A prior question may be shown even when it has no rating. An unvoted history record never supplies an answer and never triggers downvote suppression; the normal RAG graph still runs.
 
@@ -73,7 +85,7 @@ The matcher compares the query embedding to saved feedback embeddings and embedd
 
 When no shortcut returns an answer, `_initial_state()` creates the request state. Unless explicit `chat_history` is supplied, history comes from `AppStore.history(session_id, max_history_turns)`. The graph executes through `graph.invoke()`. In streaming mode it runs in a worker thread and publishes progress/token/result events into a queue. `_format_response()` converts evaluation fields to the API shape and saves the exchange when `session_id` exists.
 
-## 3. Graph topology, nodes, and conditional edges
+## 3. Graph flow, steps, and branch rules
 
 ### 3.1 Exact graph
 
@@ -111,7 +123,7 @@ There is no edge from a terminal node back into the graph. The only loops are th
 
 ### 3.2 Node 1 — `query_analysis`
 
-Implementation: `RAGService._query_analysis()`. It uses `QUERY_REWRITE_PROMPT` with the generation model in JSON mode. Inputs are original question, current standalone wording, retry number, and serialized history. It expects `standalone_query` and `rewritten_query`.
+Implementation: `RAGService._query_analysis()`. It uses `QUERY_REWRITE_PROMPT` with the generation model and asks for JSON. Inputs are the original question, the current version of the question, the retry number, and recent chat history. It expects `standalone_query` and `rewritten_query`.
 
 | Case | State update | Routing consequence |
 |---|---|---|
@@ -119,11 +131,11 @@ Implementation: `RAGService._query_analysis()`. It uses `QUERY_REWRITE_PROMPT` w
 | First rewrite failure or malformed response | Use current standalone/original for both | Continue with grounded retrieval. |
 | Retry rewrite failure | Retain the prior standalone wording | Search may repeat; retry budget remains bounded. |
 
-Example: history says “FastAPI dependencies use Depends.” The user asks “How do I add one to a route?” The model can resolve “one” into a standalone dependency question and produce a search-optimized phrase. It does not answer at this stage.
+Example: history says “FastAPI dependencies use Depends.” The user asks “How do I add one to a route?” The model can replace “one” with “a dependency” and make a clearer search phrase. It does not answer at this stage.
 
 ### 3.3 Node 2 — `retrieval`
 
-Implementation: `RAGService._retrieval()`. It embeds `rewritten_query` (falling back to standalone), searches FAISS, then maps vector IDs to stored chunks and documents. A result contains document identity/version, section/path, chunk ID/hash, vector ID, text, and similarity.
+Implementation: `RAGService._retrieval()`. It turns `rewritten_query` into an embedding (using the standalone question if needed), searches FAISS, and maps each returned vector ID back to its chunk and document. A result contains the document and version, section, chunk ID/hash, vector ID, text, and similarity score.
 
 - No filter: ask FAISS for `top_k` neighbors.
 - With `document_ids`: search up to the indexed chunk count, filter to allowed document IDs, then take `top_k`. This is exact but can cost more than metadata-aware search.
@@ -132,7 +144,7 @@ Implementation: `RAGService._retrieval()`. It embeds `rewritten_query` (falling 
 
 Example: FAISS returns vectors 11–15. A filter allows only the documents containing vectors 12 and 14, so only those two reach grading.
 
-Edge cases: no indexed chunks or a filter matching no chunks returns an empty list. The current router may spend its bounded retry budget rewriting a query even though an empty corpus cannot yield evidence. This is a candidate optimization.
+Edge cases: no indexed chunks or a filter matching no chunks returns an empty list. The graph may still spend its limited retry budget rewriting the query even though an empty index cannot return evidence. It would be faster to detect an empty index and stop immediately.
 
 ### 3.4 Node 3 — `document_grading`
 
@@ -145,7 +157,7 @@ Implementation: `RAGService._document_grading()`. This is the first judge decisi
 | Valid grades; none relevant | Empty relevant docs; retry if budget remains | Rewrite or insufficient. |
 | Missing grade, wrong type, invalid JSON, model outage | `error=judge_unavailable` | Safe response. |
 
-The judge is instructed to reject topical similarity without evidence. Generation sees only `relevant_documents`. Edge case: the lookup is keyed by `chunk_id`; duplicate IDs could associate a judge grade with the wrong chunk, so chunk IDs should be globally unique.
+The evaluator is told to reject a chunk that is only about the same topic but does not help answer the question. Generation sees only `relevant_documents`. Edge case: grades are matched by `chunk_id`; duplicate chunk IDs could apply a grade to the wrong chunk, so IDs need to be unique across the index.
 
 ### 3.5 Router after grading
 
@@ -168,7 +180,7 @@ The source list is built from the actual evidence chunk; answer text needs no so
 
 ### 3.7 Node 5 — `answer_evaluation`
 
-Implementation: `RAGService._answer_evaluation()`. It gives the judge the **original** question, draft, and relevant evidence. The JSON contract requires integer scores for faithfulness, relevance, correctness, unsupported claims, and feedback.
+Implementation: `RAGService._answer_evaluation()`. It gives the evaluator the **original** question, the draft, and relevant evidence. The JSON response must contain integer scores for faithfulness, relevance, correctness, plus unsupported claims and feedback.
 
 `overall = round(0.45 × faithfulness + 0.30 × relevance + 0.25 × correctness)`.
 
@@ -180,7 +192,7 @@ A pass requires `overall >= MINIMUM_OVERALL_SCORE` and **each** dimension `>= MI
 | Relevance | Does the answer address the user’s original question? |
 | Correctness | Is it consistent with the evidence? |
 
-The evaluator validates integer type/range and unsupported-claim list types. It returns `should_regenerate=true` only when failed and `generation_retry_count < 1`; otherwise the graph goes safe. One improvement: `unsupported_claims` is returned but does not independently veto a numeric pass, so define an explicit policy.
+The evaluator checks that scores are integers from 0 to 100 and that unsupported claims are strings. If the answer fails and no regeneration has been used, the graph tries one correction. Otherwise it returns the safe response. One improvement: `unsupported_claims` is returned but does not itself block a numeric pass, so the project should define what to do when the list is non-empty.
 
 ### 3.8 Router after evaluation
 
@@ -224,7 +236,7 @@ The safe branches intentionally discard unapproved prose and return no citations
 | `error`, `response_status` | Operational error and response status. | Router checks error before success. |
 | `correction_feedback` | Judge feedback for regeneration. | Populated by answer evaluation. |
 | `should_retry`, `should_regenerate` | Router flags. | Set by the node owning the decision. |
-| `stream_output`, `progress_callback` | Streaming mode and event side channel. | Callback is not persisted graph state. |
+| `stream_output`, `progress_callback` | Streaming mode and progress-event callback. | The callback does not change graph state. |
 
 ## 5. Worked traces and edge cases
 
@@ -316,7 +328,7 @@ Votes are preference signals, not evidence. Current documentation remains the sy
 
 ### Negative feedback flow
 
-The matcher scans newest-first entries. It counts strong (>=0.93) semantically matching downvotes only when their stored corpus fingerprint equals the current corpus. Three consecutive qualifying downvotes return fixed insufficient-evidence text; a qualifying upvote resets the counter. Lower-similarity candidates do not affect this action.
+The matcher scans newest-first entries. It counts strong (>=0.93) matching downvotes only when the saved document-set fingerprint matches the current indexed documents. Three consecutive qualifying downvotes return fixed insufficient-evidence text; a qualifying upvote resets the counter. Lower-similarity candidates do not affect this action.
 
 Product tradeoff: a downvote may mean poor phrasing, not absent evidence. Suppressing an answer may mislead if the docs can answer it. Consider forcing normal retrieval/evaluation on downvotes rather than returning insufficient evidence.
 
@@ -324,7 +336,7 @@ Product tradeoff: a downvote may mean poor phrasing, not absent evidence. Suppre
 
 - History display includes at most 100 newest distinct stored questions.
 - That history is re-embedded on each query; simple for a small assignment but not scalable.
-- Feedback rows are loaded as a full list and currently lack an idempotent/unique vote constraint.
+- Feedback rows are loaded as a full list. The server does not prevent a repeated submission from counting as another vote.
 - Matching is document-scope-sensitive: feedback saved under a different `document_ids` scope is not eligible.
 - Version/hash checks prevent stale cache use; popularity never overrides source freshness.
 
@@ -406,15 +418,17 @@ Useful log events: `query_pipeline_started`, `http_request_started`, `graph_node
 | Priority | Finding | Why it matters | Recommendation |
 |---|---|---|---|
 | P1 — trust | `draft_token` is published by generation before evaluation passes. | Unsupported text can be seen before it is rejected; reset/final replacement happens later. | Decide between approved-only buffered streaming and explicitly visible draft streaming; keep UI and API contract aligned. |
-| P1 — feedback integrity | `/feedback` inserts a row each time; no unique vote key/idempotency. | Repeated submissions can reach the three-vote shortcut threshold. | Add unique session/question/answer key and define vote-change semantics. |
+| P1 — feedback integrity | `/feedback` inserts a row each time; it does not prevent duplicate vote submissions. | Repeated submissions can reach the three-vote shortcut threshold. | Add a unique session/question/answer key and define how a changed vote should work. |
 | P2 — evaluator | `unsupported_claims` is validated/returned but does not independently veto a numeric pass. | Judge may list unsupported claims and still pass. | Explicitly reject or reconcile claims. |
-| P2 — follow-up evaluation | Generation uses `standalone_query`, while answer evaluation scores against `original_query` only. | For anaphoric follow-ups such as “what about async?”, the evaluator may score an answer against a question that lacks its resolved subject. | Give evaluation both original wording and resolved standalone wording plus relevant history, and clarify which wording is authoritative. |
+| P2 — follow-up evaluation | Generation uses `standalone_query`, while answer evaluation scores against `original_query` only. | For follow-ups like “what about async?”, evaluation may see a question without the subject resolved from chat history. | Give evaluation the original and resolved questions, plus relevant history, and specify which wording to score. |
 | P2 — fallback configuration | Fallbacks are keyed by primary model name. If `GENERATION_MODEL` and `JUDGE_MODEL` are configured to the same model with different chains, the dictionary entry for the later role overwrites the earlier chain. | One role can silently use the other role's fallback list. | Merge chains deterministically or validate that shared primary models use the same chain. |
 | P2 — memory scaling | Every query re-embeds up to 100 history questions; all feedback rows are read. | Latency and work grow with history/votes. | Persist question embeddings; bound feedback reads/retention or add a nearest-neighbor store. |
 | P2 — SSE lifecycle | Daemon query thread has no client-disconnect cancellation. | Expensive work may continue after browser stops listening. | Pass a cancellation event through model/retrieval iteration. |
 | P2 — empty corpus | Empty index can consume rewrite retries. | Adds model calls despite no possible evidence. | Detect no indexed chunks before graph retries. |
 | P2 — documentation drift | README still says threshold 0.92 and shows an S1 source label not emitted by current source list. | Setup and response examples disagree with runtime. | Update README defaults/schema examples. |
 | P3 — test coverage | Tests do not cover SSE resets, shortcut freshness invalidation, duplicate votes, or real fallback chains. | Important branches may regress. | Add focused fake-based tests and one SSE integration test. |
+
+**Where to start in the code:** streaming drafts: `retrieval/service.py` (`_stream_model_answer`, `_generation`) and `frontend/src/App.jsx`; feedback recording: `app.py` (`feedback`) and `retrieval/store.py` (`save_feedback`); evaluation rules: `retrieval/service.py` (`_answer_evaluation`); model-chain setup: `retrieval/service.py` (`RAGService.__init__`); history matching: `retrieval/service.py` (`_feedback_shortcut`); query worker: `retrieval/service.py` (`query_stream`).
 
 Suggested order: (1) make votes idempotent; (2) choose streaming contract; (3) define unsupported-claim policy; (4) add empty-corpus short-circuit and edge tests; (5) persist embeddings/add SSE cancellation; (6) refresh README.
 
