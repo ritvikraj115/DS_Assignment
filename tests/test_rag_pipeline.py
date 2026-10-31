@@ -7,6 +7,8 @@ import pytest
 
 from retrieval.config import RetrievalConfig
 from retrieval.llm import GeminiClient, ModelError
+from retrieval.schemas import (AnswerEvaluationOutput, DocumentGradingOutput, QueryRewriteOutput,
+                               parse_structured_output)
 from retrieval.service import QueryCancelled, RAGService, UNVERIFIED
 from retrieval.store import AppStore
 
@@ -25,6 +27,25 @@ DOCUMENTS = [
     {"document_id": "doc-2", "filename": "fastapi_routes.md", "source_url": None, "version": 1,
      "content_hash": "doc-hash-2", "created_at": "2026-10-31T00:00:00Z", "updated_at": "2026-10-31T00:00:00Z"},
 ]
+
+
+@pytest.mark.parametrize(("schema", "payload"), [
+    (QueryRewriteOutput, {"standalone_query": "follow-up"}),
+    (DocumentGradingOutput, {"grades": [{"chunk_id": "c1", "relevant": "yes", "reason": "ok"}]}),
+    (DocumentGradingOutput, {"grades": [
+        {"chunk_id": "c1", "relevant": True, "reason": "ok"},
+        {"chunk_id": "c1", "relevant": False, "reason": "duplicate"},
+    ]}),
+    (AnswerEvaluationOutput, {
+        "faithfulness": {"score": 101, "reason": "ok"},
+        "relevance": {"score": 90, "reason": "ok"},
+        "correctness": {"score": 90, "reason": "ok"},
+        "unsupported_claims": [], "feedback": "",
+    }),
+])
+def test_structured_model_outputs_are_pydantic_validated(schema, payload):
+    with pytest.raises(ModelError, match="failed .* validation"):
+        parse_structured_output(json.dumps(payload), schema)
 
 
 class FakeMetadata:

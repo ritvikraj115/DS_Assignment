@@ -14,9 +14,11 @@ from langgraph.graph import END, START, StateGraph
 from ingestion.service import IngestionService
 
 from .config import RetrievalConfig
-from .llm import GeminiClient, ModelClient, ModelError, parse_json_response
+from .llm import GeminiClient, ModelClient, ModelError
 from .models import RAGState
 from .prompts import EVALUATION_PROMPT, GENERATION_PROMPT, GRADE_PROMPT, QUERY_REWRITE_PROMPT
+from .schemas import (AnswerEvaluationOutput, DocumentGradingOutput, QueryRewriteOutput,
+                      parse_structured_output)
 
 log = logging.getLogger(__name__)
 INSUFFICIENT = "I couldn't find enough relevant documentation to answer that question reliably."
@@ -109,11 +111,11 @@ class RAGService:
                 original_query=original, standalone_query=state.get("standalone_query", original),
                 retry_count=state.get("retry_count", 0), chat_history=json.dumps(state.get("chat_history", []), ensure_ascii=False),
             ), json_mode=True)
-            data = parse_json_response(raw)
-            standalone = str(data.get("standalone_query", "")).strip()
-            rewritten = str(data.get("rewritten_query", standalone)).strip()
+            data = parse_structured_output(raw, QueryRewriteOutput)
+            standalone = data.standalone_query.strip()
+            rewritten = data.rewritten_query.strip()
             if not standalone or not rewritten:
-                raise ModelError("Query rewrite response is missing required fields")
+                raise ModelError("Query rewrite response contains empty questions")
             log.info("graph_node_completed request_id=%s node=query_analysis retry_count=%s duration_ms=%.1f",
                      state.get("request_id"), state.get("retry_count", 0), (perf_counter() - started) * 1000)
             return {"standalone_query": standalone, "rewritten_query": rewritten, "error": None}
@@ -201,17 +203,16 @@ class RAGService:
             raw = self.model_client.generate(self.config.judge_model, GRADE_PROMPT.format(
                 question=state["standalone_query"], documents=json.dumps(compact, ensure_ascii=False),
             ), json_mode=True)
-            data = parse_json_response(raw)
-            grades = data.get("grades")
-            if not isinstance(grades, list):
-                raise ModelError("Document grading response has no grades list")
-            by_id = {str(g.get("chunk_id")): g for g in grades if isinstance(g, dict)}
+            data = parse_structured_output(raw, DocumentGradingOutput)
+            by_id = {grade.chunk_id: grade for grade in data.grades}
+            if set(by_id) != {doc["chunk_id"] for doc in docs}:
+                raise ModelError("Document grading response does not match retrieved chunks")
             graded = []
             for doc in docs:
                 grade = by_id.get(doc["chunk_id"])
-                if grade is None or not isinstance(grade.get("relevant"), bool):
+                if grade is None:
                     raise ModelError("Document grading response omitted a retrieved chunk")
-                graded.append({**doc, "relevant": grade["relevant"], "reason": str(grade.get("reason", ""))})
+                graded.append({**doc, "relevant": grade.relevant, "reason": grade.reason})
             relevant = [doc for doc in graded if doc["relevant"]]
             retry = not relevant and state.get("retry_count", 0) < self.config.max_retrieval_retries
             log.info("graph_node_completed request_id=%s node=document_grading relevant=%s retry=%s duration_ms=%.1f",
@@ -660,33 +661,26 @@ class RAGService:
                 standalone_query=state.get("standalone_query") or state["original_query"],
                 answer=state.get("answer", ""), documents=json.dumps(docs, ensure_ascii=False),
             ), json_mode=True)
-            data = parse_json_response(raw)
+            data = parse_structured_output(raw, AnswerEvaluationOutput)
             scores, reasons = {}, {}
             for dimension in ("faithfulness", "relevance", "correctness"):
-                item = data.get(dimension)
-                if not isinstance(item, dict) or not isinstance(item.get("score"), int) or isinstance(item.get("score"), bool):
-                    raise ModelError(f"Evaluation response has invalid {dimension} score")
-                score = item["score"]
-                if not 0 <= score <= 100:
-                    raise ModelError(f"Evaluation {dimension} score must be between 0 and 100")
-                scores[dimension] = score
-                reasons[dimension] = str(item.get("reason", ""))
-            unsupported = data.get("unsupported_claims", [])
-            if not isinstance(unsupported, list) or not all(isinstance(item, str) for item in unsupported):
-                raise ModelError("Evaluation unsupported_claims must be a list of strings")
+                item = getattr(data, dimension)
+                scores[dimension] = item.score
+                reasons[dimension] = item.reason
+            unsupported = data.unsupported_claims
             overall = round(.45 * scores["faithfulness"] + .30 * scores["relevance"] + .25 * scores["correctness"])
             passed = not unsupported and overall >= self.config.minimum_overall_score and all(
                 scores[key] >= self.config.minimum_dimension_score for key in scores
             )
             evaluation = {**scores, "overall": overall, "reasons": reasons,
                           "unsupported_claims": unsupported,
-                          "feedback": str(data.get("feedback", "")), "passed": passed,
+                          "feedback": data.feedback, "passed": passed,
                           "status": "passed" if passed else "failed"}
             log.info("graph_node_completed request_id=%s node=answer_evaluation status=%s overall=%s faithfulness=%s relevance=%s correctness=%s duration_ms=%.1f",
                      state.get("request_id"), evaluation["status"], overall, scores["faithfulness"], scores["relevance"], scores["correctness"],
                      (perf_counter() - started) * 1000)
             regenerate = not passed and state.get("generation_retry_count", 0) < 1
-            correction_feedback = str(data.get("feedback", "Improve grounding and answer relevance."))
+            correction_feedback = data.feedback or "Improve grounding and answer relevance."
             if unsupported:
                 correction_feedback += " Remove or rewrite these unsupported claims: " + json.dumps(unsupported, ensure_ascii=False)
             if regenerate:
