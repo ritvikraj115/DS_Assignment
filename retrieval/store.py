@@ -138,6 +138,52 @@ class AppStore:
             self.connection.execute("DELETE FROM conversation_messages WHERE session_id=?", (session_id,))
             self.connection.execute("DELETE FROM feedback WHERE session_id=?", (session_id,))
 
+    def close(self) -> None:
+        self.connection.close()
+
+    @staticmethod
+    def _references_chunks(value: Any, document_id: str, chunk_ids: set[str]) -> bool:
+        if isinstance(value, dict):
+            if value.get("document_id") == document_id and value.get("chunk_id") in chunk_ids:
+                return True
+            return any(AppStore._references_chunks(child, document_id, chunk_ids) for child in value.values())
+        if isinstance(value, list):
+            return any(AppStore._references_chunks(child, document_id, chunk_ids) for child in value)
+        return False
+
+    def invalidate_chunk_memory(self, document_id: str, chunk_ids: set[str]) -> dict[str, int]:
+        if not chunk_ids:
+            return {"feedback": 0, "exchanges": 0}
+        removed_feedback = 0
+        removed_exchanges = 0
+        with self.connection:
+            feedback_rows = self.connection.execute("SELECT feedback_id, sources_json FROM feedback").fetchall()
+            feedback_ids = [row["feedback_id"] for row in feedback_rows
+                            if self._references_chunks(json.loads(row["sources_json"] or "[]"), document_id, chunk_ids)]
+            if feedback_ids:
+                self.connection.executemany("DELETE FROM feedback WHERE feedback_id=?", [(item,) for item in feedback_ids])
+                removed_feedback = len(feedback_ids)
+
+            assistant_rows = self.connection.execute(
+                "SELECT id, session_id, metadata_json FROM conversation_messages WHERE role='assistant' AND metadata_json IS NOT NULL"
+            ).fetchall()
+            delete_ids: set[int] = set()
+            for row in assistant_rows:
+                metadata = json.loads(row["metadata_json"] or "{}")
+                if not self._references_chunks(metadata, document_id, chunk_ids):
+                    continue
+                delete_ids.add(row["id"])
+                previous = self.connection.execute(
+                    "SELECT id, role FROM conversation_messages WHERE session_id=? AND id<? ORDER BY id DESC LIMIT 1",
+                    (row["session_id"], row["id"]),
+                ).fetchone()
+                if previous and previous["role"] == "user":
+                    delete_ids.add(previous["id"])
+            if delete_ids:
+                self.connection.executemany("DELETE FROM conversation_messages WHERE id=?", [(item,) for item in delete_ids])
+                removed_exchanges = len(delete_ids) // 2
+        return {"feedback": removed_feedback, "exchanges": removed_exchanges}
+
     def save_feedback(self, session_id: str | None, question: str, rating: str, comment: str | None, *,
                       answer: str = "", confidence: dict[str, Any] | None = None,
                       sources: list[dict[str, Any]] | None = None,

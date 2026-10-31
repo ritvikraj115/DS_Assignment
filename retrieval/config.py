@@ -17,8 +17,8 @@ class RetrievalConfig:
     minimum_dimension_score: int = 70
     minimum_overall_score: int = 75
     max_history_turns: int = 8
-    feedback_similarity_threshold: float = 0.80
-    feedback_direct_similarity_threshold: float = 0.93
+    feedback_positive_similarity_threshold: float = 0.72
+    feedback_negative_similarity_threshold: float = 0.80
 
     @classmethod
     def from_env(cls) -> "RetrievalConfig":
@@ -39,8 +39,8 @@ class RetrievalConfig:
             minimum_dimension_score=int(os.getenv("MINIMUM_DIMENSION_SCORE", "70")),
             minimum_overall_score=int(os.getenv("MINIMUM_OVERALL_SCORE", "75")),
             max_history_turns=int(os.getenv("MAX_HISTORY_TURNS", "8")),
-            feedback_similarity_threshold=float(os.getenv("FEEDBACK_SIMILARITY_THRESHOLD", "0.80")),
-            feedback_direct_similarity_threshold=float(os.getenv("FEEDBACK_DIRECT_SIMILARITY_THRESHOLD", "0.93")),
+            feedback_positive_similarity_threshold=float(os.getenv("FEEDBACK_POSITIVE_SIMILARITY_THRESHOLD", "0.72")),
+            feedback_negative_similarity_threshold=float(os.getenv("FEEDBACK_NEGATIVE_SIMILARITY_THRESHOLD", "0.80")),
         )
 
     def validate(self) -> None:
@@ -52,7 +52,7 @@ class RetrievalConfig:
             raise ValueError("MAX_RETRIEVAL_RETRIES must be between 0 and 2")
         if not 0 <= self.minimum_dimension_score <= 100 or not 0 <= self.minimum_overall_score <= 100:
             raise ValueError("Evaluation thresholds must be between 0 and 100")
-        if not 0.0 <= self.feedback_similarity_threshold <= 1.0:
-            raise ValueError("FEEDBACK_SIMILARITY_THRESHOLD must be between 0 and 1")
-        if not self.feedback_similarity_threshold <= self.feedback_direct_similarity_threshold <= 1.0:
-            raise ValueError("FEEDBACK_DIRECT_SIMILARITY_THRESHOLD must be at least FEEDBACK_SIMILARITY_THRESHOLD and at most 1")
+        if not 0.0 <= self.feedback_positive_similarity_threshold <= 1.0:
+            raise ValueError("FEEDBACK_POSITIVE_SIMILARITY_THRESHOLD must be between 0 and 1")
+        if not 0.0 <= self.feedback_negative_similarity_threshold <= 1.0:
+            raise ValueError("FEEDBACK_NEGATIVE_SIMILARITY_THRESHOLD must be between 0 and 1")

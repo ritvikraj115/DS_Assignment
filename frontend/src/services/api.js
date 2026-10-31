@@ -39,7 +39,6 @@ const STREAM_STAGE_LABELS = {
   memory_match: 'Similar previous questions found',
   memory_none: 'No similar previous questions found',
   memory_unavailable: 'Previous-question matching unavailable',
-  feedback_synthesis: 'Preparing an answer from helpful past responses',
   feedback_shortcut: 'Using a version-checked past answer',
   query_analysis: 'Understanding the question',
   retrieval: 'Searching indexed documentation',

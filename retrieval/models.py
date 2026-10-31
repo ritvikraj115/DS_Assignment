@@ -17,6 +17,7 @@ class RAGState(TypedDict, total=False):
     relevant_documents: list[dict[str, Any]]
     answer: str
     sources: list[dict[str, Any]]
+    memory_sources: list[dict[str, Any]]
     evaluation_scores: dict[str, Any]
     confidence_score: int | None
     retry_count: int

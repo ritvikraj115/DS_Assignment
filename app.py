@@ -72,6 +72,8 @@ def create_app(rag_service: RAGService | None = None, ingestion_service: Ingesti
             app.state.rag_service = RAGService(app.state.ingestion_service, RetrievalConfig.from_env(), app_store=app.state.app_store)
         elif app.state.rag_service is not None and app.state.rag_service.app_store is None:
             app.state.rag_service.app_store = app.state.app_store
+        if app.state.ingestion_service is not None:
+            app.state.ingestion_service.memory_store = app.state.app_store
         return app.state.rag_service, app.state.ingestion_service, app.state.app_store
 
     @app.get("/health")
@@ -182,7 +184,7 @@ def create_app(rag_service: RAGService | None = None, ingestion_service: Ingesti
     @app.post("/feedback")
     def feedback(request: FeedbackRequest):
         try:
-            _, ingestion, store = runtime(require_ingestion=True)
+            rag, ingestion, store = runtime(require_ingestion=True, require_rag=True)
             question = request.question.strip()
             verified = store.verified_exchange(request.session_id, question, request.answer)
             if not verified:
@@ -193,14 +195,21 @@ def create_app(rag_service: RAGService | None = None, ingestion_service: Ingesti
             ]
             corpus_snapshot = sorted((doc["document_id"], doc.get("version"), doc.get("content_hash")) for doc in scoped)
             corpus_fingerprint = hashlib.sha256(json.dumps(corpus_snapshot, separators=(",", ":")).encode("utf-8")).hexdigest()
-            vectors = ingestion.embedder.encode([question])
+            feedback_question = verified.get("feedback_question") or question
+            vectors = ingestion.embedder.encode([feedback_question])
             if len(vectors) != 1:
                 raise RuntimeError("Could not encode question for semantic feedback matching")
+            canonical_question = rag.canonical_feedback_question(
+                feedback_question, request.rating, request.document_ids, vectors[0])
+            canonical_vectors = ingestion.embedder.encode([canonical_question]) if canonical_question != feedback_question else vectors
+            if len(canonical_vectors) != 1:
+                raise RuntimeError("Could not encode canonical feedback question")
             # Answer metadata comes from the server-side conversation record, not client-submitted source fields.
             result = store.save_feedback(
-                request.session_id, question, request.rating, request.comment,
-                answer=request.answer, confidence=verified.get("confidence"), sources=verified.get("sources", []),
-                question_embedding=vectors[0], corpus_fingerprint=corpus_fingerprint,
+                request.session_id, canonical_question, request.rating, request.comment,
+                answer=request.answer, confidence=verified.get("confidence"),
+                sources=verified.get("sources") or verified.get("memory_sources", []),
+                question_embedding=canonical_vectors[0], corpus_fingerprint=corpus_fingerprint,
                 document_ids=request.document_ids, response_status=verified.get("status"),
             )
             log.info("feedback_recorded feedback_id=%s rating=%s", result["feedback_id"], request.rating)

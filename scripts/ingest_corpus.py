@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 from ingestion.service import IngestionService  # noqa: E402
+from retrieval.store import AppStore  # noqa: E402
 
 log = logging.getLogger("corpus_ingestion")
 
@@ -23,6 +24,8 @@ def main() -> int:
     manifest = ROOT / "corpus" / "sources.json"
     sources = json.loads(manifest.read_text(encoding="utf-8"))
     service = IngestionService()
+    memory_store = AppStore(service.config.sqlite_path)
+    service.memory_store = memory_store
     failures = 0
     try:
         for source in sources:
@@ -35,6 +38,7 @@ def main() -> int:
                 failures += 1
                 log.exception("corpus_source_failed title=%s", source["title"])
     finally:
+        memory_store.close()
         service.metadata.close()
     return 1 if failures else 0
 

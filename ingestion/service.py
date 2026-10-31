@@ -20,13 +20,15 @@ log = logging.getLogger(__name__)
 class IngestionService:
     """Reusable ingestion entry point, ready to be called from a FastAPI route."""
 
-    def __init__(self, config: IngestionConfig | None = None, embedder=None, metadata_store=None, indexer=None):
+    def __init__(self, config: IngestionConfig | None = None, embedder=None, metadata_store=None, indexer=None,
+                 memory_store=None):
         self.config = config or IngestionConfig.from_env()
         self.config.validate()
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder or SentenceTransformerEmbedder(self.config.embedding_model)
         self.metadata = metadata_store or MetadataStore(self.config.sqlite_path, self.config.mongodb_uri, self.config.mongodb_database)
         self.indexer = indexer or FaissIndexer(self.config.faiss_index_path)
+        self.memory_store = memory_store
         # Metadata is the recovery source of truth after an interrupted index promotion.
         self.indexer.rebuild(self.metadata.get_chunks())
         self.chunker = StructureAwareChunker(self.config.chunk_size, self.config.chunk_overlap)
@@ -100,6 +102,9 @@ class IngestionService:
                 chunk.embedding, chunk.vector_id = [float(v) for v in vector], vector_id
             log.info("embedding_completed document_id=%s vectors=%s", document_id, len(vectors))
         chunks = proposed
+        current_chunk_hashes = {chunk.chunk_id: chunk.content_hash for chunk in chunks}
+        stale_chunk_ids = {chunk["chunk_id"] for chunk in old_chunks
+                           if current_chunk_hashes.get(chunk["chunk_id"]) != chunk["content_hash"]}
         now = utc_now()
         document = {
             "document_id": document_id, "filename": parsed.filename, "source_url": parsed.source_url,
@@ -133,6 +138,13 @@ class IngestionService:
                 # Persisted metadata remains authoritative; startup will repair the index.
                 pass
             raise
+        if stale_chunk_ids and self.memory_store:
+            try:
+                invalidated = self.memory_store.invalidate_chunk_memory(document_id, stale_chunk_ids)
+                log.info("ingestion_memory_invalidated document_id=%s stale_chunks=%s feedback=%s exchanges=%s",
+                         document_id, len(stale_chunk_ids), invalidated["feedback"], invalidated["exchanges"])
+            except Exception:
+                log.exception("Could not remove memory tied to updated chunks document_id=%s", document_id)
         result = IngestionResult(document_id, "indexed" if not previous else "updated", len(chunks),
                                added_chunks=len(new_chunks), retained_chunks=retained,
                                removed_chunks=max(0, len(old_chunks) - retained), updated_at=now,

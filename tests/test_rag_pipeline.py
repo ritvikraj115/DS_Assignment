@@ -213,9 +213,23 @@ def test_regenerated_answer_failure_returns_safe_unverified_response():
 
     assert result["status"] == "unverified"
     assert result["answer"] == UNVERIFIED
-    assert result["confidence"]["overall"] is None
+    assert result["confidence"]["overall"] == 48
     assert result["confidence"]["status"] == "failed"
     assert result["sources"] == []
+
+
+def test_failed_regeneration_keeps_numeric_confidence_and_internal_source_references(tmp_path):
+    model = ScriptedModel(evaluations=[evaluation(30, 60, 50), evaluation(40, 60, 50)],
+                          answers=["Unsupported claim.", "Still unsupported."])
+    store = AppStore(tmp_path / "app.sqlite3")
+    rag, _, _ = make_rag(model, app_store=store)
+
+    response = rag.query("How does FastAPI declare dependencies?", session_id="low-confidence")
+    saved = store.verified_exchange("low-confidence", "How does FastAPI declare dependencies?", response["answer"])
+
+    assert response["confidence"]["overall"] == 48
+    assert response["sources"] == []
+    assert saved["memory_sources"][0]["chunk_id"] == "chunk_001"
 
 
 def test_unsupported_claim_forces_regeneration_even_with_high_scores():
@@ -371,10 +385,10 @@ def test_feedback_answer_cache_is_rejected_when_source_chunk_changes(tmp_path):
     sources = [{"document": "fastapi_dependencies.md", "section": "Dependency Injection",
                 "chunk_id": "chunk_001", "document_id": "doc-1", "document_version": 1,
                 "chunk_hash": "a"}]
-    for session_id in ("vote-1", "vote-2", "vote-3"):
-        store.save_feedback(session_id, question, "up", None, answer=answer, sources=sources,
-                            question_embedding=[1.0, 0.0], corpus_fingerprint=fingerprint,
-                            response_status="passed")
+    store.save_feedback("vote-1", question, "up", None, answer=answer, sources=sources,
+                        confidence={"overall": 90, "status": "passed"},
+                        question_embedding=[1.0, 0.0], corpus_fingerprint=fingerprint,
+                        response_status="passed")
 
     cached = rag._feedback_shortcut(question, "query-session", None)
     assert cached["feedback_shortcut"] == "upvoted_answer"
@@ -382,6 +396,98 @@ def test_feedback_answer_cache_is_rejected_when_source_chunk_changes(tmp_path):
     changed_chunks = [{**CHUNKS[0], "content_hash": "new-chunk-hash"}]
     changed_rag, _, _ = make_rag(chunks=changed_chunks, documents=DOCUMENTS[:1], app_store=store)
     assert changed_rag._feedback_shortcut(question, "query-session", None) is None
+
+
+def test_feedback_shortcut_needs_one_confident_positive_and_keeps_response_array(tmp_path):
+    store = AppStore(tmp_path / "app.sqlite3")
+    rag, _, _ = make_rag(app_store=store)
+    question = "How does FastAPI declare dependencies?"
+    fingerprint = rag._feedback_corpus_fingerprint(DOCUMENTS[:1])
+    sources = [{"document": "fastapi_dependencies.md", "section": "Dependency Injection",
+                "chunk_id": "chunk_001", "document_id": "doc-1", "document_version": 1,
+                "chunk_hash": "a"}]
+    for index, answer in enumerate(("Use Depends() for dependencies.", "Declare Depends() in a route.")):
+        store.save_feedback(f"voter-{index}", question, "up", None, answer=answer, sources=sources,
+                            confidence={"overall": 90, "status": "passed"}, question_embedding=[1.0, 0.0],
+                            corpus_fingerprint=fingerprint, response_status="passed")
+
+    result = rag._feedback_shortcut(question, "query-session", None)
+
+    assert result["feedback_shortcut"] == "upvoted_answer"
+    assert result["feedback_score"] == 1
+    assert len(result["feedback_responses"]) == 2
+
+
+def test_negative_feedback_requires_net_below_minus_one_and_low_confidence(tmp_path):
+    question = "How does FastAPI declare dependencies?"
+
+    def seed_store(confidence):
+        store = AppStore(tmp_path / f"{confidence}.sqlite3")
+        rag, _, _ = make_rag(app_store=store)
+        fingerprint = rag._feedback_corpus_fingerprint(DOCUMENTS[:1])
+        for session_id in ("voter-1", "voter-2"):
+            store.save_feedback(session_id, question, "down", None, answer="Unverified answer.",
+                                confidence={"overall": confidence, "status": "failed"},
+                                question_embedding=[1.0, 0.0], corpus_fingerprint=fingerprint,
+                                response_status="unverified")
+        return rag
+
+    low_confidence = seed_store(60)._feedback_shortcut(question, "query-session", None)
+    high_confidence = seed_store(90)._feedback_shortcut(question, "query-session", None)
+
+    assert low_confidence["status"] == "insufficient_evidence"
+    assert high_confidence is None
+
+
+def test_feedback_similarity_thresholds_deduplicate_to_canonical_question(tmp_path):
+    store = AppStore(tmp_path / "app.sqlite3")
+    rag, _, _ = make_rag(app_store=store)
+    store.save_feedback("voter-1", "How do I declare dependencies?", "up", None,
+                        answer="Use Depends().", confidence={"overall": 90},
+                        question_embedding=[1.0, 0.0])
+
+    canonical = rag.canonical_feedback_question(
+        "How do I use Depends in FastAPI?", "down", None, [1.0, 0.0])
+
+    assert rag.config.feedback_positive_similarity_threshold == 0.72
+    assert rag.config.feedback_negative_similarity_threshold == 0.80
+    assert canonical == "How do I declare dependencies?"
+
+
+def test_positive_and_negative_feedback_use_their_own_similarity_cutoffs(tmp_path):
+    store = AppStore(tmp_path / "app.sqlite3")
+    rag, _, _ = make_rag(app_store=store)
+    store.save_feedback("voter-1", "How do I declare dependencies?", "up", None,
+                        answer="Use Depends().", question_embedding=[0.75, (1 - 0.75 ** 2) ** 0.5])
+
+    positive_match = rag.canonical_feedback_question("Similar follow-up", "up", None, [1.0, 0.0])
+    negative_match = rag.canonical_feedback_question("Similar follow-up", "down", None, [1.0, 0.0])
+
+    assert positive_match == "How do I declare dependencies?"
+    assert negative_match == "Similar follow-up"
+
+
+def test_followup_feedback_is_saved_under_resolved_question(tmp_path):
+    from fastapi.testclient import TestClient
+    from app import create_app
+
+    store = AppStore(tmp_path / "app.sqlite3")
+    store.save_exchange("session-1", "How do I use FastAPI dependencies?", "Use Depends() in the route.")
+    model = ScriptedModel(rewrites=[{"standalone_query": "How do I declare FastAPI dependencies?",
+                                    "rewritten_query": "FastAPI dependency declaration Depends"}])
+    rag, _, _ = make_rag(model, app_store=store)
+    client = TestClient(create_app(rag_service=rag, app_store=store))
+    response = client.post("/query", json={"question": "Retry that answer", "session_id": "session-1"})
+    assert response.status_code == 200
+    assert response.json()["feedback_question"] == "How do I declare FastAPI dependencies?"
+
+    feedback = client.post("/feedback", json={
+        "question": "Retry that answer", "rating": "up", "session_id": "session-1",
+        "answer": response.json()["answer"],
+    })
+
+    assert feedback.status_code == 200
+    assert store.feedback_entries()[0]["question"] == "How do I declare FastAPI dependencies?"
 
 
 def test_shared_primary_model_merges_fallback_chains_and_client_uses_them():

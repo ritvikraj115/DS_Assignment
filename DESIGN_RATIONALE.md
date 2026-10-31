@@ -8,6 +8,19 @@ Ingestion turns files and documentation URLs into structured text blocks. The pa
 
 For a question, the retrieval graph first resolves conversational references so a follow-up such as `what about async?` can be searched and evaluated with its subject understood. It retrieves candidate chunks, checks their relevance, drafts an answer from the evidence, and evaluates that answer. A failed draft gets one correction attempt; if it still cannot be supported, the app returns a safe response. Streaming begins only after the answer passes evaluation, so an unverified draft is not shown as if it were final.
 
+### LangGraph flow
+
+Before the graph runs, the app checks whether a strongly upvoted answer to a similar question can be reused safely. If there is no valid match, the flow is:
+
+`Query analysis -> Retrieval -> Document grading -> Generation -> Answer evaluation -> Final answer`
+
+The conditional paths are simple:
+
+- Relevant chunks go to generation. If no chunks are relevant, the graph retries from query analysis up to the configured limit, then returns an insufficient-evidence response.
+- A passing evaluation returns the answer and sources. A failed first evaluation gets one correction attempt; a second failure or an unavailable judge returns a safe response.
+
+The graph state carries the original and resolved questions, retrieved and relevant chunks, retry counts, draft, sources, and evaluation result between these steps.
+
 ## Chunking and embeddings
 
 Chunking is structure-aware and boundary-aware. Blocks under the same heading are grouped; prose is split at sentence or newline boundaries when it grows beyond the configured size. The default target is 1,000 characters with 150 characters of overlap. Code fences and tables are kept together when possible, even if that means a chunk exceeds the target. Each chunk retains its section path for citations.
@@ -22,7 +35,7 @@ I kept the workflow modest for an assignment-sized app: a small number of graph 
 
 ## What makes this version distinct
 
-The additions focus on how people actually use a documentation assistant. Follow-up questions can use recent conversation context. Users can give a direct thumbs-up or thumbs-down without writing a comment. Similar prior questions can be surfaced, and strongly supported answers may be reused only while their source chunks are still current. The interface shows the current processing stage, provides confidence and source details, and streams only an approved answer. These choices make the system easier to inspect without exposing internal draft text.
+The additions focus on how people actually use a documentation assistant. Follow-up questions can use recent conversation context, and feedback on a follow-up is attached to its resolved standalone question. Users can give a direct thumbs-up or thumbs-down without writing a comment. Semantically similar questions share a canonical entry with an array of responses; positive answers can be reused after one positive vote when confidence is at least 75 and citations remain current. Repeated negative feedback suppresses future answers only when its net score is below -1 and downvoted answers have low confidence. When source chunks change, feedback and conversation exchanges tied to those chunks are removed. The interface shows the current processing stage, provides confidence and source details, and streams only an approved answer. These choices make the system easier to inspect without exposing internal draft text.
 
 ## What I would improve next
 
