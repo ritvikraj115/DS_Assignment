@@ -1,8 +1,13 @@
 import json
+import threading
+import time
+import types
+
+import pytest
 
 from retrieval.config import RetrievalConfig
-from retrieval.llm import ModelError
-from retrieval.service import RAGService, UNVERIFIED
+from retrieval.llm import GeminiClient, ModelError
+from retrieval.service import QueryCancelled, RAGService, UNVERIFIED
 from retrieval.store import AppStore
 
 
@@ -24,8 +29,8 @@ DOCUMENTS = [
 
 class FakeMetadata:
     def __init__(self, chunks=None, documents=None):
-        self.chunks = chunks or CHUNKS[:1]
-        self.documents = documents or DOCUMENTS[:1]
+        self.chunks = CHUNKS[:1] if chunks is None else chunks
+        self.documents = DOCUMENTS[:1] if documents is None else documents
 
     def get_chunks(self):
         return self.chunks
@@ -93,6 +98,11 @@ class ScriptedModel:
         if prompt.startswith("Evaluate"):
             return json.dumps(self.evaluations.pop(0) if self.evaluations else evaluation())
         raise AssertionError(f"Unexpected prompt: {prompt[:50]}")
+
+    def generate_stream(self, model, prompt, *, on_fallback=None):
+        text = self.generate(model, prompt)
+        for start in range(0, len(text), 12):
+            yield text[start:start + 12]
 
 
 def make_rag(model=None, *, hits=None, chunks=None, documents=None, app_store=None, retries=2):
@@ -187,6 +197,32 @@ def test_regenerated_answer_failure_returns_safe_unverified_response():
     assert result["sources"] == []
 
 
+def test_unsupported_claim_forces_regeneration_even_with_high_scores():
+    model = ScriptedModel(
+        evaluations=[evaluation(98, 98, 98, unsupported=["The dependency is cached forever."]), evaluation()],
+        answers=["The dependency is cached forever.", "Use Depends() to declare a dependency."],
+    )
+    rag, _, _ = make_rag(model)
+
+    result = rag.query("How does FastAPI declare dependencies?")
+
+    assert result["status"] == "passed"
+    assert result["generation_retry_count"] == 1
+    generation_prompts = [prompt for _, prompt, _ in model.calls if prompt.startswith("Answer")]
+    assert "The dependency is cached forever" in generation_prompts[1]
+
+
+def test_empty_index_skips_rewrite_and_retrieval_retries():
+    rag, model, ingestion = make_rag(chunks=[], documents=[])
+
+    result = rag.query("How does FastAPI declare dependencies?")
+
+    assert result["status"] == "insufficient_evidence"
+    assert result["retry_count"] == 0
+    assert not model.calls
+    assert ingestion.indexer.calls == 0
+
+
 def test_follow_up_uses_session_history_to_resolve_standalone_query():
     model = ScriptedModel(rewrites=[{"standalone_query": "How do I declare FastAPI dependencies?",
                                     "rewritten_query": "FastAPI dependency declaration Depends"}])
@@ -196,8 +232,11 @@ def test_follow_up_uses_session_history_to_resolve_standalone_query():
                             {"role": "assistant", "content": "They use Depends."}])
 
     rewrite_prompt = next(prompt for _, prompt, _ in model.calls if prompt.startswith("Rewrite"))
+    evaluation_prompt = next(prompt for _, prompt, _ in model.calls if prompt.startswith("Evaluate"))
     assert "They use Depends." in rewrite_prompt
     assert ingestion.embedder.queries[-1] == "FastAPI dependency declaration Depends"
+    assert "Original user question: How does FastAPI declare dependencies?" in evaluation_prompt
+    assert "Resolved standalone question: How do I declare FastAPI dependencies?" in evaluation_prompt
 
 
 def test_judge_rate_limit_returns_unverified_and_never_passes():
@@ -247,6 +286,200 @@ def test_prior_question_memory_is_checked_without_feedback(tmp_path):
     match_event = next(event for event in events if event["stage"] == "memory_match")
     assert match_event["matches"][0]["question"] == "How does FastAPI declare dependencies?"
     assert match_event["matches"][0]["rating"] is None
+    stored = store.recent_question_records()[0]
+    assert stored["question_embedding"] == [1.0, 0.0]
+    embedded_count = len(rag.ingestion.embedder.queries)
+    rag._feedback_shortcut("How does FastAPI declare dependencies?", "session-3", None)
+    assert len(rag.ingestion.embedder.queries) == embedded_count + 1
+
+
+def test_feedback_submission_updates_existing_vote_instead_of_counting_twice(tmp_path):
+    store = AppStore(tmp_path / "app.sqlite3")
+    first = store.save_feedback("session-1", "How do I declare a dependency?", "up", None,
+                                answer="Use Depends().")
+    second = store.save_feedback("session-1", "  HOW DO I DECLARE A DEPENDENCY?  ", "down", None,
+                                 answer="Use Depends().")
+
+    rows = store.feedback_entries()
+    assert second["status"] == "updated"
+    assert first["feedback_id"] == second["feedback_id"]
+    assert len(rows) == 1
+    assert rows[0]["rating"] == "down"
+
+
+def test_store_migration_keeps_newest_of_legacy_duplicate_votes(tmp_path):
+    path = tmp_path / "app.sqlite3"
+    store = AppStore(path)
+    store.save_feedback("session-1", "How do I declare a dependency?", "up", None,
+                        answer="Use Depends().")
+    store.connection.execute("DROP INDEX ux_feedback_session_question_answer")
+    original = dict(store.connection.execute("SELECT * FROM feedback").fetchone())
+    original["feedback_id"] = "legacy-duplicate"
+    original["rating"] = "down"
+    original["created_at"] = "9999-01-01T00:00:00Z"
+    columns = list(original)
+    store.connection.execute(
+        f"INSERT INTO feedback ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+        [original[column] for column in columns],
+    )
+    store.connection.commit()
+
+    migrated = AppStore(path)
+
+    rows = migrated.feedback_entries()
+    assert len(rows) == 1
+    assert rows[0]["rating"] == "down"
+    assert rows[0]["feedback_id"] == "legacy-duplicate"
+
+
+def test_feedback_entries_are_bounded(tmp_path):
+    store = AppStore(tmp_path / "app.sqlite3")
+    for index in range(4):
+        store.save_feedback(f"session-{index}", f"Question {index}", "up", None,
+                            answer=f"Answer {index}")
+
+    assert len(store.feedback_entries(limit=2)) == 2
+
+
+def test_feedback_answer_cache_is_rejected_when_source_chunk_changes(tmp_path):
+    store = AppStore(tmp_path / "app.sqlite3")
+    rag, _, _ = make_rag(app_store=store)
+    question = "How does FastAPI declare dependencies?"
+    answer = "Use Depends() to declare a dependency."
+    fingerprint = rag._feedback_corpus_fingerprint(DOCUMENTS[:1])
+    sources = [{"document": "fastapi_dependencies.md", "section": "Dependency Injection",
+                "chunk_id": "chunk_001", "document_id": "doc-1", "document_version": 1,
+                "chunk_hash": "a"}]
+    for session_id in ("vote-1", "vote-2", "vote-3"):
+        store.save_feedback(session_id, question, "up", None, answer=answer, sources=sources,
+                            question_embedding=[1.0, 0.0], corpus_fingerprint=fingerprint,
+                            response_status="passed")
+
+    cached = rag._feedback_shortcut(question, "query-session", None)
+    assert cached["feedback_shortcut"] == "upvoted_answer"
+
+    changed_chunks = [{**CHUNKS[0], "content_hash": "new-chunk-hash"}]
+    changed_rag, _, _ = make_rag(chunks=changed_chunks, documents=DOCUMENTS[:1], app_store=store)
+    assert changed_rag._feedback_shortcut(question, "query-session", None) is None
+
+
+def test_shared_primary_model_merges_fallback_chains_and_client_uses_them():
+    config = RetrievalConfig(generation_model="shared", judge_model="shared",
+                             generation_fallback_models=("gen-lite", "common-lite"),
+                             judge_fallback_models=("judge-lite", "gen-lite"))
+    fallbacks = RAGService._fallback_model_map(config)
+    assert fallbacks == {"shared": ("gen-lite", "common-lite", "judge-lite")}
+
+    client = GeminiClient.__new__(GeminiClient)
+    client.model_fallbacks = fallbacks
+    calls = []
+
+    def generate_once(self, model, prompt, *, json_mode=False):
+        calls.append(model)
+        if model in {"shared", "gen-lite"}:
+            raise ModelError("temporary failure", retryable=True)
+        return "fallback response"
+
+    client._generate_once = types.MethodType(generate_once, client)
+    assert client.generate("shared", "test prompt") == "fallback response"
+    assert calls == ["shared", "gen-lite", "common-lite"]
+
+
+def test_streaming_sends_answer_only_after_evaluation_approves_it():
+    rag, _, _ = make_rag()
+
+    events = list(rag.query_stream("How does FastAPI declare dependencies?"))
+
+    assert events[-1]["type"] == "result"
+    assert events[-1]["response"]["status"] == "passed"
+    assert not any(event["type"] == "draft_token" for event in events)
+    approved_index = next(index for index, event in enumerate(events)
+                          if event["type"] == "stage" and event.get("stage") == "approved")
+    token_indices = [index for index, event in enumerate(events) if event["type"] == "token"]
+    assert token_indices and min(token_indices) > approved_index
+    streamed = "".join(event["text"] for event in events if event["type"] == "token")
+    assert streamed == events[-1]["response"]["answer"]
+
+
+def test_stream_fallback_resets_partial_model_output_without_emitting_draft():
+    class FallbackStreamClient:
+        def generate_stream(self, model, prompt, *, on_fallback=None):
+            yield "partial from failed model"
+            on_fallback()
+            yield "approved fallback answer"
+
+    rag, _, _ = make_rag()
+    rag.model_client = FallbackStreamClient()
+    events = []
+
+    answer = rag._stream_model_answer("primary", "prompt", events.append)
+
+    assert answer == "approved fallback answer"
+    assert events == [{"type": "reset_draft"}]
+
+
+def test_sse_disconnect_stops_before_retrieval_after_current_model_call():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingRewriteModel(ScriptedModel):
+        def generate(self, model, prompt, *, json_mode=False):
+            if prompt.startswith("Rewrite"):
+                entered.set()
+                release.wait(timeout=3)
+            return super().generate(model, prompt, json_mode=json_mode)
+
+    model = BlockingRewriteModel()
+    rag, _, ingestion = make_rag(model)
+    stream = rag.query_stream("How does FastAPI declare dependencies?")
+    assert next(stream)["stage"] == "started"
+    while True:
+        event = next(stream)
+        if event.get("stage") == "query_analysis":
+            break
+    assert entered.wait(timeout=1)
+    stream.close()
+    release.set()
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and any(thread.name == "rag-stream-query" for thread in threading.enumerate()):
+        time.sleep(.01)
+    assert ingestion.indexer.calls == 0
+
+
+def test_fastapi_sse_streams_only_approved_answer_text(tmp_path):
+    from fastapi.testclient import TestClient
+    from app import create_app
+
+    store = AppStore(tmp_path / "app.sqlite3")
+    rag, _, _ = make_rag(app_store=store)
+    client = TestClient(create_app(rag_service=rag, app_store=store))
+
+    response = client.post("/query", json={
+        "question": "How does FastAPI declare dependencies?",
+        "session_id": "stream-session", "stream": True,
+    })
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    parsed = []
+    for frame in response.text.split("\n\n"):
+        name, data = None, None
+        for line in frame.splitlines():
+            if line.startswith("event:"):
+                name = line[6:].strip()
+            elif line.startswith("data:"):
+                data = json.loads(line[5:].strip())
+        if name and data is not None:
+            parsed.append((name, data))
+
+    assert parsed[-1][0] == "result"
+    assert parsed[-1][1]["response"]["status"] == "passed"
+    assert all(name != "draft_token" for name, _ in parsed)
+    approved = next(index for index, (name, data) in enumerate(parsed)
+                    if name == "stage" and data.get("stage") == "approved")
+    token_positions = [index for index, (name, _) in enumerate(parsed) if name == "token"]
+    assert token_positions and min(token_positions) > approved
 
 
 def test_fastapi_health_query_documents_and_feedback_endpoints(tmp_path):

@@ -84,7 +84,11 @@ export default function ChatMessage({ message, sessionId }) {
           </div>
         </details>
       })()}
-      {message.status === 'streaming' && message.content && <div className="draft-verification"><LoaderCircle size={12} className="spin" /> Draft response · checking against the cited documentation</div>}
+      {message.status === 'streaming' && message.content && <div className="draft-verification">
+        {message.progress?.at(-1)?.stage === 'approved'
+          ? <><Check size={12} /> Verified answer · streaming</>
+          : <><LoaderCircle size={12} className="spin" /> Preparing verified answer</>}
+      </div>}
       <div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={{ pre: CodeBlock }}>{visibleContent}</ReactMarkdown></div>
       {message.confidence && <ConfidencePanel confidence={message.confidence} status={message.status} />}
       <SourceList sources={message.sources} />

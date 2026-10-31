@@ -5,7 +5,7 @@ import hashlib
 import logging
 import re
 from queue import Queue
-from threading import Thread
+from threading import Event, Thread
 from time import perf_counter
 from typing import Any
 
@@ -23,6 +23,10 @@ INSUFFICIENT = "I couldn't find enough relevant documentation to answer that que
 UNVERIFIED = "I couldn't verify an answer against the documentation right now, so I won't present an unverified response."
 
 
+class QueryCancelled(Exception):
+    """Raised between pipeline steps after an SSE client disconnects."""
+
+
 class RAGService:
     def __init__(self, ingestion: IngestionService, config: RetrievalConfig | None = None,
                  model_client: ModelClient | None = None, app_store=None):
@@ -31,16 +35,28 @@ class RAGService:
         self.config.validate()
         self.model_client = model_client or GeminiClient(
             self.config.gemini_api_key, self.config.gemini_timeout_ms,
-            model_fallbacks={
-                self.config.generation_model: self.config.generation_fallback_models,
-                self.config.judge_model: self.config.judge_fallback_models,
-            },
+            model_fallbacks=self._fallback_model_map(self.config),
         )
         self.app_store = app_store
         self.graph = self._build_graph()
 
     @staticmethod
+    def _fallback_model_map(config: RetrievalConfig) -> dict[str, tuple[str, ...]]:
+        """Merge role fallback lists when both roles share a primary model."""
+        merged: dict[str, list[str]] = {}
+        for primary, fallbacks in (
+            (config.generation_model, config.generation_fallback_models),
+            (config.judge_model, config.judge_fallback_models),
+        ):
+            chain = merged.setdefault(primary, [])
+            chain.extend(model for model in fallbacks if model not in chain and model != primary)
+        return {primary: tuple(chain) for primary, chain in merged.items()}
+
+    @staticmethod
     def _progress(state: RAGState, stage: str, detail: str) -> None:
+        cancel_event = state.get("cancel_event")
+        if cancel_event and cancel_event.is_set():
+            raise QueryCancelled()
         callback = state.get("progress_callback")
         if callback:
             callback({"type": "stage", "stage": stage, "detail": detail})
@@ -79,6 +95,15 @@ class RAGService:
             self._progress(state, "retrieval_retry", f"The first search found no suitable sources. Trying a revised search ({state['retry_count'] + 1})…")
         log.info("graph_node_started request_id=%s node=query_analysis retry_count=%s history_messages=%s",
                  state.get("request_id"), state.get("retry_count", 0), len(state.get("chat_history", [])))
+        indexed_chunks = self.ingestion.metadata.get_chunks()
+        requested_documents = state.get("document_ids")
+        requested_set = set(requested_documents) if requested_documents is not None else None
+        if not indexed_chunks or (requested_set is not None and not any(
+                chunk["document_id"] in requested_set for chunk in indexed_chunks)):
+            self._progress(state, "insufficient_evidence", "There are no indexed chunks in the selected document scope.")
+            return {"standalone_query": state.get("standalone_query") or original,
+                    "rewritten_query": state.get("rewritten_query") or original,
+                    "search_scope_empty": True, "error": None}
         try:
             raw = self.model_client.generate(self.config.generation_model, QUERY_REWRITE_PROMPT.format(
                 original_query=original, standalone_query=state.get("standalone_query", original),
@@ -107,8 +132,15 @@ class RAGService:
         started = perf_counter()
         self._progress(state, "retrieval", "Searching the indexed documentation…")
         log.info("graph_node_started request_id=%s node=retrieval retry_count=%s top_k=%s", state.get("request_id"), state.get("retry_count", 0), state.get("top_k"))
+        if state.get("search_scope_empty"):
+            return {"retrieved_documents": [], "search_scope_empty": True}
         if state.get("error"):
             return {"retrieved_documents": []}
+        all_chunks = self.ingestion.metadata.get_chunks()
+        document_ids = state.get("document_ids")
+        allowed = set(document_ids) if document_ids is not None else None
+        if not all_chunks or (allowed is not None and not any(chunk["document_id"] in allowed for chunk in all_chunks)):
+            return {"retrieved_documents": [], "search_scope_empty": True}
         query = state.get("rewritten_query") or state["standalone_query"]
         try:
             vectors = self.ingestion.embedder.encode([query])
@@ -117,13 +149,10 @@ class RAGService:
             return {"error": "embedding_failed", "retrieved_documents": []}
         if len(vectors) != 1:
             return {"error": "embedding_failed", "retrieved_documents": []}
-        all_chunks = self.ingestion.metadata.get_chunks()
         by_vector = {int(c["vector_id"]): c for c in all_chunks}
         doc_info = {d["document_id"]: d for d in self.ingestion.metadata.list_documents()}
-        document_ids = state.get("document_ids")
         try:
-            if document_ids is not None:
-                allowed = set(document_ids)
+            if allowed is not None:
                 # Filtering candidates before final top-k keeps document filtering exact.
                 candidate_ids = {int(c["vector_id"]) for c in all_chunks if c["document_id"] in allowed}
                 if not candidate_ids:
@@ -152,7 +181,7 @@ class RAGService:
             })
         log.info("graph_node_completed request_id=%s node=retrieval hits=%s retry_count=%s duration_ms=%.1f",
                  state.get("request_id"), len(result), state.get("retry_count", 0), (perf_counter() - started) * 1000)
-        return {"retrieved_documents": result}
+        return {"retrieved_documents": result, "search_scope_empty": False}
 
     def _document_grading(self, state: RAGState) -> dict[str, Any]:
         started = perf_counter()
@@ -160,7 +189,8 @@ class RAGService:
         self._progress(state, "source_review", f"Checking {len(docs)} retrieved source{'s' if len(docs) != 1 else ''} for relevance…")
         log.info("graph_node_started request_id=%s node=document_grading retrieved=%s", state.get("request_id"), len(docs))
         if not docs:
-            retry = state.get("retry_count", 0) < self.config.max_retrieval_retries
+            retry = (not state.get("search_scope_empty", False)
+                     and state.get("retry_count", 0) < self.config.max_retrieval_retries)
             log.info("graph_node_completed request_id=%s node=document_grading relevant=0 retry=%s duration_ms=%.1f",
                      state.get("request_id"), retry, (perf_counter() - started) * 1000)
             return {"graded_documents": [], "relevant_documents": [], "should_retry": retry,
@@ -220,7 +250,7 @@ class RAGService:
     def _remove_inline_source_tags(answer: str) -> str:
         return re.sub(r"\s*\[S\d*\]?", "", answer, flags=re.IGNORECASE).strip()
 
-    def _stream_model_answer(self, model: str, prompt: str, progress_callback=None) -> str:
+    def _stream_model_answer(self, model: str, prompt: str, progress_callback=None, cancel_event=None) -> str:
         stream_generator = getattr(self.model_client, "generate_stream", None)
         if not stream_generator:
             return self._remove_inline_source_tags(self.model_client.generate(model, prompt))
@@ -237,19 +267,37 @@ class RAGService:
             stream = stream_generator(model, prompt, on_fallback=reset_for_fallback)
         except TypeError:  # Support simple model clients with the older two-argument stream method.
             stream = stream_generator(model, prompt)
-        for piece in stream:
-            answer_parts.append(piece)
-            pending[0] += piece
-            partial_tag = re.search(r"\[(?:S\d*)?$", pending[0], flags=re.IGNORECASE)
-            safe_end = partial_tag.start() if partial_tag else len(pending[0])
-            visible = self._remove_inline_source_tags(pending[0][:safe_end])
-            pending[0] = pending[0][safe_end:]
-            if visible and progress_callback:
-                progress_callback({"type": "draft_token", "text": visible})
-        final_piece = self._remove_inline_source_tags(pending[0])
-        if final_piece and progress_callback:
-            progress_callback({"type": "draft_token", "text": final_piece})
+        try:
+            for piece in stream:
+                if cancel_event and cancel_event.is_set():
+                    raise QueryCancelled()
+                answer_parts.append(piece)
+                pending[0] += piece
+                partial_tag = re.search(r"\[(?:S\d*)?$", pending[0], flags=re.IGNORECASE)
+                safe_end = partial_tag.start() if partial_tag else len(pending[0])
+                pending[0] = pending[0][safe_end:]
+        finally:
+            if cancel_event and cancel_event.is_set() and hasattr(stream, "close"):
+                stream.close()
         return self._remove_inline_source_tags("".join(answer_parts))
+
+    def _save_exchange(self, session_id: str | None, question: str, answer: str,
+                       metadata: dict[str, Any] | None = None,
+                       question_embedding: list[float] | None = None) -> None:
+        if not self.app_store or not session_id:
+            return
+        if question_embedding is None:
+            try:
+                vectors = self.ingestion.embedder.encode([question])
+                question_embedding = vectors[0] if len(vectors) == 1 else None
+            except Exception:
+                log.exception("Could not embed question for conversation memory persistence")
+        try:
+            self.app_store.save_exchange(session_id, question, answer, metadata,
+                                         question_embedding=question_embedding)
+        except TypeError:
+            # Keep lightweight third-party/test stores compatible during migration.
+            self.app_store.save_exchange(session_id, question, answer, metadata)
 
     @staticmethod
     def _feedback_corpus_fingerprint(documents: list[dict[str, Any]]) -> str:
@@ -269,7 +317,8 @@ class RAGService:
                                       docs_by_id: dict[str, dict[str, Any]],
                                       chunks_by_document: dict[tuple[str, str], dict[str, Any]],
                                       session_id: str | None, *, stream_output: bool = False,
-                                      progress_callback=None) -> dict[str, Any]:
+                                      progress_callback=None, question_embedding=None,
+                                      cancel_event=None) -> dict[str, Any]:
         document_lookup = {doc["document_id"]: doc for doc in self.ingestion.metadata.list_documents()}
         selected_chunks: dict[tuple[str, str], dict[str, Any]] = {}
         for group in groups:
@@ -322,7 +371,7 @@ class RAGService:
             )
             try:
                 if stream_output:
-                    answer = self._stream_model_answer(self.config.generation_model, prompt, progress_callback)
+                    answer = self._stream_model_answer(self.config.generation_model, prompt, progress_callback, cancel_event)
                 else:
                     answer = self._remove_inline_source_tags(self.model_client.generate(self.config.generation_model, prompt))
                 if not answer:
@@ -333,10 +382,13 @@ class RAGService:
                 break
 
             evaluation_result = self._answer_evaluation({
-                "original_query": question, "answer": answer, "relevant_documents": docs,
+                "original_query": question, "standalone_query": question,
+                "answer": answer, "relevant_documents": docs,
                 "generation_retry_count": attempt, "request_id": None, "correction_feedback": "",
-                "progress_callback": progress_callback,
+                "progress_callback": progress_callback, "cancel_event": cancel_event,
             })
+            if cancel_event and cancel_event.is_set():
+                raise QueryCancelled()
             evaluation = evaluation_result.get("evaluation_scores", {})
             if evaluation.get("passed"):
                 confidence = {key: evaluation.get(key) for key in ("overall", "faithfulness", "relevance", "correctness", "status", "reasons", "unsupported_claims") if key in evaluation}
@@ -345,7 +397,7 @@ class RAGService:
                             "generation_retry_count": attempt, "fallback_used": False, "error": None,
                             "feedback_shortcut": "upvoted_synthesis", "feedback_votes": sum(group["count"] for group in groups)}
                 if self.app_store:
-                    self.app_store.save_exchange(session_id, question, answer, response)
+                    self._save_exchange(session_id, question, answer, response, question_embedding)
                 if progress_callback:
                     progress_callback({"type": "stage", "stage": "approved",
                                        "detail": "The synthesized answer passed verification against current cited chunks."})
@@ -362,7 +414,7 @@ class RAGService:
                     "generation_retry_count": 0, "fallback_used": False, "error": evaluation_result.get("error"),
                     "feedback_shortcut": "upvoted_synthesis_unverified"}
         if self.app_store:
-            self.app_store.save_exchange(session_id, question, response["answer"], response)
+            self._save_exchange(session_id, question, response["answer"], response, question_embedding)
         if progress_callback:
             progress_callback({"type": "stage", "stage": "unverified",
                                "detail": "The synthesized answer could not be verified. Showing a safe response."})
@@ -370,7 +422,7 @@ class RAGService:
 
     def _feedback_shortcut(self, question: str, session_id: str | None,
                            document_ids: list[str] | None, *, stream_output: bool = False,
-                           progress_callback=None) -> dict[str, Any] | None:
+                           progress_callback=None, cancel_event=None) -> dict[str, Any] | None:
         if progress_callback:
             progress_callback({"type": "stage", "stage": "memory_check",
                                "detail": "Checking prior questions and feedback for a semantic match…"})
@@ -393,6 +445,8 @@ class RAGService:
                 progress_callback({"type": "stage", "stage": "memory_unavailable",
                                    "detail": "Could not compare feedback memory; continuing to document search."})
             return None
+        if cancel_event and cancel_event.is_set():
+            raise QueryCancelled()
         query_embedding = vector[0]
         selected = set(document_ids) if document_ids is not None else None
         documents = self.ingestion.metadata.list_documents()
@@ -414,19 +468,41 @@ class RAGService:
         # records above can affect answer reuse or downvote suppression.
         history_matches = []
         try:
-            recent_questions = self.app_store.recent_questions(limit=100) if hasattr(self.app_store, "recent_questions") else []
-            recent_questions = [text for text in recent_questions if text.strip()]
-            if recent_questions:
-                history_vectors = self.ingestion.embedder.encode(recent_questions)
-                if len(history_vectors) == len(recent_questions):
-                    history_matches = [
-                        {"question": text, "similarity": self._cosine(query_embedding, stored), "rating": None}
-                        for text, stored in zip(recent_questions, history_vectors)
-                    ]
-                    history_matches = [item for item in history_matches
-                                       if item["similarity"] >= self.config.feedback_similarity_threshold]
+            records_method = getattr(self.app_store, "recent_question_records", None)
+            if records_method:
+                records = records_method(limit=100)
+                missing = [record for record in records if not record.get("question_embedding")]
+                if missing:
+                    missing_vectors = self.ingestion.embedder.encode([record["question"] for record in missing])
+                    if len(missing_vectors) == len(missing):
+                        for record, embedding in zip(missing, missing_vectors):
+                            record["question_embedding"] = embedding
+                            store_embedding = getattr(self.app_store, "store_question_embedding", None)
+                            if store_embedding:
+                                store_embedding(record["id"], embedding)
+                history_matches = [
+                    {"question": record["question"],
+                     "similarity": self._cosine(query_embedding, record["question_embedding"]), "rating": None}
+                    for record in records if record.get("question_embedding")
+                ]
+            else:
+                # Compatibility for lightweight stores that have not added stored vectors.
+                recent_questions = self.app_store.recent_questions(limit=100) if hasattr(self.app_store, "recent_questions") else []
+                recent_questions = [text for text in recent_questions if text.strip()]
+                if recent_questions:
+                    history_vectors = self.ingestion.embedder.encode(recent_questions)
+                    if len(history_vectors) == len(recent_questions):
+                        history_matches = [
+                            {"question": text, "similarity": self._cosine(query_embedding, stored), "rating": None}
+                            for text, stored in zip(recent_questions, history_vectors)
+                        ]
+            history_matches = [item for item in history_matches
+                               if item["similarity"] >= self.config.feedback_similarity_threshold]
         except Exception:
             log.exception("Could not compare prior conversation questions for memory display")
+
+        if cancel_event and cancel_event.is_set():
+            raise QueryCancelled()
 
         visible_matches = {
             " ".join(entry["question"].casefold().split()):
@@ -478,7 +554,7 @@ class RAGService:
                         "error": None, "feedback_shortcut": "downvote_suppression",
                     }
                     if self.app_store:
-                        self.app_store.save_exchange(session_id, question, response["answer"], response)
+                        self._save_exchange(session_id, question, response["answer"], response, vector[0])
                     log.info("feedback_shortcut_applied kind=downvote_suppression consecutive_votes=%s", consecutive_downvotes)
                     return response
             else:
@@ -522,7 +598,8 @@ class RAGService:
             return None
         if len(valid_groups) > 1 or valid_groups[0]["direct_count"] < 3:
             return self._synthesize_upvoted_responses(question, valid_groups, docs_by_id,
-                chunks_by_document, session_id, stream_output=stream_output, progress_callback=progress_callback)
+                chunks_by_document, session_id, stream_output=stream_output, progress_callback=progress_callback,
+                question_embedding=vector[0], cancel_event=cancel_event)
         best = valid_groups[0]
         if best["direct_count"] < 3:
             return None
@@ -535,7 +612,7 @@ class RAGService:
                     "generation_retry_count": 0, "fallback_used": False, "error": None,
                     "feedback_shortcut": "upvoted_answer", "feedback_votes": best["count"]}
         if self.app_store:
-            self.app_store.save_exchange(session_id, question, response["answer"], response)
+            self._save_exchange(session_id, question, response["answer"], response, vector[0])
         log.info("feedback_shortcut_applied kind=upvoted_answer votes=%s", best["count"])
         return response
 
@@ -559,7 +636,8 @@ class RAGService:
                 documents=json.dumps(excerpt, ensure_ascii=False),
             )
             if state.get("stream_output"):
-                answer = self._stream_model_answer(self.config.generation_model, prompt, state.get("progress_callback"))
+                answer = self._stream_model_answer(self.config.generation_model, prompt,
+                                                   state.get("progress_callback"), state.get("cancel_event"))
             else:
                 answer = self._remove_inline_source_tags(self.model_client.generate(self.config.generation_model, prompt))
             if not answer:
@@ -578,7 +656,9 @@ class RAGService:
                 for d in state.get("relevant_documents", [])]
         try:
             raw = self.model_client.generate(self.config.judge_model, EVALUATION_PROMPT.format(
-                question=state["original_query"], answer=state.get("answer", ""), documents=json.dumps(docs, ensure_ascii=False),
+                question=state["original_query"],
+                standalone_query=state.get("standalone_query") or state["original_query"],
+                answer=state.get("answer", ""), documents=json.dumps(docs, ensure_ascii=False),
             ), json_mode=True)
             data = parse_json_response(raw)
             scores, reasons = {}, {}
@@ -595,7 +675,7 @@ class RAGService:
             if not isinstance(unsupported, list) or not all(isinstance(item, str) for item in unsupported):
                 raise ModelError("Evaluation unsupported_claims must be a list of strings")
             overall = round(.45 * scores["faithfulness"] + .30 * scores["relevance"] + .25 * scores["correctness"])
-            passed = overall >= self.config.minimum_overall_score and all(
+            passed = not unsupported and overall >= self.config.minimum_overall_score and all(
                 scores[key] >= self.config.minimum_dimension_score for key in scores
             )
             evaluation = {**scores, "overall": overall, "reasons": reasons,
@@ -606,6 +686,9 @@ class RAGService:
                      state.get("request_id"), evaluation["status"], overall, scores["faithfulness"], scores["relevance"], scores["correctness"],
                      (perf_counter() - started) * 1000)
             regenerate = not passed and state.get("generation_retry_count", 0) < 1
+            correction_feedback = str(data.get("feedback", "Improve grounding and answer relevance."))
+            if unsupported:
+                correction_feedback += " Remove or rewrite these unsupported claims: " + json.dumps(unsupported, ensure_ascii=False)
             if regenerate:
                 self._progress(state, "answer_retry", "The draft did not meet the evidence checks. Revising it against evaluator feedback…")
             elif not passed:
@@ -613,7 +696,7 @@ class RAGService:
             return {"evaluation_scores": evaluation, "confidence_score": overall, "error": None,
                     "should_regenerate": regenerate,
                     "generation_retry_count": state.get("generation_retry_count", 0) + int(regenerate),
-                    "correction_feedback": str(data.get("feedback", "Improve grounding and answer relevance."))}
+                    "correction_feedback": correction_feedback}
         except ModelError as exc:
             log.error("Answer evaluation failed after %.1f ms: %s", (perf_counter() - started) * 1000, exc)
             return {"evaluation_scores": {"status": "unverified", "reason": str(exc)},
@@ -648,7 +731,8 @@ class RAGService:
 
     def _initial_state(self, question: str, session_id: str | None, *, document_ids: list[str] | None = None,
                        top_k: int | None = None, chat_history: list[dict[str, str]] | None = None,
-                       request_id: str | None = None, stream_output: bool = False, progress_callback=None) -> RAGState:
+                       request_id: str | None = None, stream_output: bool = False, progress_callback=None,
+                       cancel_event=None) -> RAGState:
         history = chat_history or (self.app_store.history(session_id, self.config.max_history_turns) if self.app_store else [])
         return {
             "original_query": question, "standalone_query": question, "rewritten_query": question,
@@ -658,6 +742,7 @@ class RAGService:
             "confidence_score": None, "retry_count": 0, "generation_retry_count": 0,
             "fallback_used": False, "error": None, "response_status": "pending", "correction_feedback": "",
             "stream_output": stream_output, "progress_callback": progress_callback,
+            "cancel_event": cancel_event, "search_scope_empty": False,
         }
 
     def _format_response(self, result: dict[str, Any], session_id: str | None) -> dict[str, Any]:
@@ -675,7 +760,7 @@ class RAGService:
                     "retry_count": result.get("retry_count", 0), "generation_retry_count": result.get("generation_retry_count", 0),
                     "fallback_used": result.get("fallback_used", False), "error": result.get("error")}
         if self.app_store:
-            self.app_store.save_exchange(session_id, result.get("original_query", ""), response["answer"], response)
+            self._save_exchange(session_id, result.get("original_query", ""), response["answer"], response)
         return response
 
     def query(self, question: str, session_id: str | None = None, *, document_ids: list[str] | None = None,
@@ -695,31 +780,44 @@ class RAGService:
         """Yield progress events, then approved answer pieces and the final response."""
         events: Queue = Queue()
         finished = object()
+        cancel_event = Event()
 
         def publish(event):
-            events.put(event)
+            if not cancel_event.is_set():
+                events.put(event)
 
         def run_graph():
             try:
                 shortcut = self._feedback_shortcut(question, session_id, document_ids,
-                                                   stream_output=True, progress_callback=publish)
+                                                   stream_output=True, progress_callback=publish,
+                                                   cancel_event=cancel_event)
+                if cancel_event.is_set():
+                    return
                 if shortcut:
                     if not shortcut.get("feedback_shortcut", "").startswith("upvoted_synthesis"):
                         publish({"type": "stage", "stage": "feedback_shortcut",
                                  "detail": ("Using a version-checked upvoted answer; retrieval was skipped."
                                             if shortcut["status"] == "passed" else
                                             "Recent matching answers received consecutive downvotes; retrieval was skipped." )})
-                    if shortcut.get("feedback_shortcut") == "upvoted_answer":
+                    if shortcut.get("status") == "passed":
                         for index in range(0, len(shortcut["answer"]), 32):
                             publish({"type": "token", "text": shortcut["answer"][index:index + 32]})
                     publish({"type": "result", "response": shortcut})
                     return
                 state = self._initial_state(question, session_id, document_ids=document_ids, top_k=top_k,
                                             chat_history=chat_history, request_id=request_id,
-                                            stream_output=True, progress_callback=publish)
+                                            stream_output=True, progress_callback=publish,
+                                            cancel_event=cancel_event)
                 result = self.graph.invoke(state)
+                if cancel_event.is_set():
+                    return
                 response = self._format_response(result, session_id)
+                if response["status"] == "passed":
+                    for index in range(0, len(response["answer"]), 32):
+                        publish({"type": "token", "text": response["answer"][index:index + 32]})
                 publish({"type": "result", "response": response})
+            except QueryCancelled:
+                log.info("query_stream_cancelled request_id=%s", request_id)
             except Exception:
                 log.exception("Streaming query failed request_id=%s", request_id)
                 publish({"type": "error", "message": "The query could not be completed. Please try again."})
@@ -727,9 +825,12 @@ class RAGService:
                 events.put(finished)
 
         Thread(target=run_graph, name=f"rag-stream-{request_id or 'query'}", daemon=True).start()
-        yield {"type": "stage", "stage": "started", "detail": "Starting the documentation assistant…"}
-        while True:
-            event = events.get()
-            if event is finished:
-                break
-            yield event
+        try:
+            yield {"type": "stage", "stage": "started", "detail": "Starting the documentation assistant…"}
+            while True:
+                event = events.get()
+                if event is finished:
+                    break
+                yield event
+        finally:
+            cancel_event.set()

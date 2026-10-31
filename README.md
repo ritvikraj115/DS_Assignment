@@ -81,15 +81,15 @@ Logs are emitted to the backend terminal with timestamp, severity, module, and e
 
 - `GET /health`
 - `POST /query` with `{ "question": "...", "session_id": "..." }`
-- `POST /query` with `"stream": true` (or `Accept: text/event-stream`) for server-sent progress and draft text on the same route. Draft text streams as it is generated and is marked pending verification; the final response replaces it if evaluation rejects it.
+- `POST /query` with `"stream": true` (or `Accept: text/event-stream`) for server-sent progress and answer text on the same route. Progress is sent while retrieval/generation/evaluation runs. Answer tokens are sent only after evaluation passes.
 - `DELETE /sessions/{session_id}` to remove a conversation and its stored feedback.
 - `POST /ingest` with multipart field `file` or `url`
 - `GET /documents`
-- `POST /feedback` with a question, `rating` (`up` or `down`), optional `session_id`, and optional comment
+- `POST /feedback` with the exact question and answer from a prior response, `rating` (`up` or `down`), and its `session_id`. Repeating a vote for the same answer updates it.
 
 Successful query responses contain `answer`, nested `confidence` values (`overall`, `faithfulness`, `relevance`, `correctness`, `status`, reasons), and `sources` with actual document, section, and chunk IDs. The overall score is a grounded confidence indicator, not a calibrated probability. Unverified answers do not receive a successful confidence score.
 
-Feedback can shortcut future semantically matching questions. If one answer has at least three upvotes, it can be reused while its cited document versions and chunk hashes remain unchanged. If three or more upvotes are split across different answers, the lightweight generation model synthesizes those responses against their current cited chunks, then the judge verifies the synthesis; retrieval is skipped. Three consecutive downvotes return an insufficient-evidence response while the indexed corpus snapshot is unchanged. Semantic matching uses the local embedding model and `FEEDBACK_SIMILARITY_THRESHOLD` (default `0.92`). Answers keep source details in the source list and omit inline `[S1]` markers.
+Feedback can shortcut future semantically matching questions. If one answer has at least three upvotes, it can be reused while its cited document versions and chunk hashes remain unchanged. If three or more upvotes are split across different answers, the lightweight generation model synthesizes those responses against their current cited chunks, then the judge verifies the synthesis; retrieval is skipped. Three consecutive strong downvotes return an insufficient-evidence response while the indexed corpus remains unchanged. Similar-question matching uses the local embedding model and `FEEDBACK_SIMILARITY_THRESHOLD` (default `0.80`); direct feedback shortcuts use `FEEDBACK_DIRECT_SIMILARITY_THRESHOLD` (default `0.93`). A session can vote once per question/answer; submitting another rating for that same answer changes the existing vote. Answers keep source details in the source list and omit inline `[S1]` markers.
 
 Example request:
 
@@ -119,7 +119,6 @@ Successful response shape (values and IDs below are illustrative):
   },
   "sources": [
     {
-      "label": "S1",
       "document": "dependencies",
       "section": "Dependencies",
       "chunk_id": "<stored-chunk-id>",
@@ -142,11 +141,11 @@ Ingest a local file and submit feedback:
 curl.exe -X POST http://127.0.0.1:8000/ingest -F "file=@docs/guide.md"
 curl.exe -X POST http://127.0.0.1:8000/feedback `
   -H "Content-Type: application/json" `
-  -d '{"question":"How do I declare a dependency?","rating":"up","session_id":"demo-session","comment":"Clear and useful."}'
+  -d '{"question":"How do I declare a FastAPI dependency?","rating":"up","session_id":"demo-session","answer":"Declare a dependency with Depends() in the path operation."}'
 curl.exe http://127.0.0.1:8000/documents
 ```
 
-`POST /ingest` returns the ingestion status and chunk counts, for example `{"document_id":"file:...","status":"indexed","chunk_count":4,"added_chunks":4,...}`. `POST /feedback` returns `{"feedback_id":"<generated-id>","status":"recorded","created_at":"<UTC timestamp>"}`. `GET /documents` returns a `documents` array containing document metadata and each document's chunk count.
+`POST /ingest` returns the ingestion status and chunk counts, for example `{"document_id":"file:...","status":"indexed","chunk_count":4,"added_chunks":4,...}`. `POST /feedback` returns a feedback ID and status (`recorded` or `updated`). `GET /documents` returns a `documents` array containing document metadata and each document's chunk count.
 
 ## Architecture
 

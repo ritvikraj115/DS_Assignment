@@ -77,7 +77,7 @@ LangGraph makes the step order and branches explicit. Each node is a Python func
 
 Both `query()` and `query_stream()` call `_feedback_shortcut()` before building or invoking the graph. A direct cached response therefore skips query rewriting, FAISS retrieval, chunk grading, normal generation, and sometimes answer evaluation. The multiple-answer synthesis route still generates and evaluates.
 
-The matcher compares the question's embedding with saved feedback embeddings and up to 100 recent distinct questions. It uses cosine similarity, a measure of how close two embeddings are. The match threshold is `FEEDBACK_SIMILARITY_THRESHOLD` (default 0.80). Direct feedback actions use the stricter `FEEDBACK_DIRECT_SIMILARITY_THRESHOLD` (default 0.93). Only feedback entries with current sources can affect answer reuse or downvote handling.
+The matcher compares the question's embedding with saved feedback embeddings and up to 100 recent distinct questions. It uses cosine similarity, a measure of how close two embeddings are. The match threshold is `FEEDBACK_SIMILARITY_THRESHOLD` (default 0.80). Direct feedback actions use the stricter `FEEDBACK_DIRECT_SIMILARITY_THRESHOLD` (default 0.93). Question embeddings are stored with conversation history; older questions are embedded once when first needed. Feedback reads are limited to the newest 500 entries. Only feedback entries with current sources can affect answer reuse or downvote handling.
 
 > **Memory display versus answer shortcut:** A prior question may be shown even when it has no rating. An unvoted history record never supplies an answer and never triggers downvote suppression; the normal RAG graph still runs.
 
@@ -144,7 +144,7 @@ Implementation: `RAGService._retrieval()`. It turns `rewritten_query` into an em
 
 Example: FAISS returns vectors 11–15. A filter allows only the documents containing vectors 12 and 14, so only those two reach grading.
 
-Edge cases: no indexed chunks or a filter matching no chunks returns an empty list. The graph may still spend its limited retry budget rewriting the query even though an empty index cannot return evidence. It would be faster to detect an empty index and stop immediately.
+Edge cases: query analysis checks whether any chunks exist in the selected document scope before calling the rewrite model. If none exist, it skips rewriting and retrieval retries, then the graph returns insufficient evidence. If chunks exist but FAISS returns no relevant results, the normal limited retry path still applies.
 
 ### 3.4 Node 3 — `document_grading`
 
@@ -167,9 +167,9 @@ Implementation: `_after_grading()`. Order matters: error first, then relevant do
 
 Implementation: `RAGService._generation()`. It builds source metadata from relevant chunks and sends their document, section, chunk ID, and text to `GENERATION_PROMPT`. The prompt says to use only the excerpts, state evidence gaps, and omit inline `[S1]` tags. Source metadata is returned separately from prose.
 
-When `generation_retry_count` is nonzero, prior evaluator feedback is added to the correction prompt. In streaming mode `_stream_model_answer()` emits `draft_token` while generating. On provider fallback or regeneration it can emit `reset_draft` to clear partial text.
+When `generation_retry_count` is nonzero, prior evaluator feedback is added to the correction prompt. In streaming mode `_stream_model_answer()` reads model chunks into a private buffer. It does not send answer text to the browser yet. On provider fallback or regeneration it can emit `reset_draft`; no unapproved answer text has been shown.
 
-Edge cases: blank model output becomes a generation error; provider failure routes to safe response. **Draft tokens can be visible before answer evaluation passes**; see review findings.
+Edge cases: blank model output becomes a generation error; provider failure routes to safe response. The user sees progress while this node runs, but answer tokens are held until the evaluation node passes.
 
 ```text
 Evidence: fastapi_dependencies.md / Dependency Injection / chunk_001
@@ -180,7 +180,7 @@ The source list is built from the actual evidence chunk; answer text needs no so
 
 ### 3.7 Node 5 — `answer_evaluation`
 
-Implementation: `RAGService._answer_evaluation()`. It gives the evaluator the **original** question, the draft, and relevant evidence. The JSON response must contain integer scores for faithfulness, relevance, correctness, plus unsupported claims and feedback.
+Implementation: `RAGService._answer_evaluation()`. It gives the evaluator the original question, the resolved standalone question, the draft, and relevant evidence. The resolved wording helps score follow-ups like “what about async?” while the original wording preserves the user's intent. The JSON response must contain integer scores for faithfulness, relevance, correctness, plus unsupported claims and feedback.
 
 `overall = round(0.45 × faithfulness + 0.30 × relevance + 0.25 × correctness)`.
 
@@ -192,7 +192,7 @@ A pass requires `overall >= MINIMUM_OVERALL_SCORE` and **each** dimension `>= MI
 | Relevance | Does the answer address the user’s original question? |
 | Correctness | Is it consistent with the evidence? |
 
-The evaluator checks that scores are integers from 0 to 100 and that unsupported claims are strings. If the answer fails and no regeneration has been used, the graph tries one correction. Otherwise it returns the safe response. One improvement: `unsupported_claims` is returned but does not itself block a numeric pass, so the project should define what to do when the list is non-empty.
+The evaluator checks that scores are integers from 0 to 100 and that unsupported claims are strings. A non-empty `unsupported_claims` list now forces a failure even if the numeric scores pass. The list is added to correction feedback. If the answer fails and no regeneration has been used, the graph tries one correction; otherwise it returns the safe response.
 
 ### 3.8 Router after evaluation
 
@@ -228,7 +228,7 @@ The safe branches intentionally discard unapproved prose and return no citations
 | `retrieved_documents` | FAISS results with evidence/metadata. | Replaced for each retrieval pass. |
 | `graded_documents` | Retrieved chunks plus relevance and reason. | Created by grader. |
 | `relevant_documents` | Evidence used for generation/evaluation. | Must be non-empty for normal generation. |
-| `answer`, `sources` | Draft and its source metadata. | Draft may stream before final verdict. |
+| `answer`, `sources` | Draft and its source metadata. | Draft stays on the server; only a passed answer is sent to the browser. |
 | `evaluation_scores`, `confidence_score` | Judge dimensions, aggregate, status. | Overall is null if judge unavailable/insufficient. |
 | `retry_count` | Retrieval rewrites already used. | Initial retrieval is not counted; configured max 0–2. |
 | `generation_retry_count` | Corrective generation attempts. | At most one. |
@@ -279,7 +279,7 @@ GeminiClient tries configured fallback models only for retryable rate-limit or t
 
 ### Trace E — similar previous question
 
-The query is embedded for memory matching. The matcher checks feedback rows in the same document scope and embeds up to 100 recent distinct conversation questions. It emits `memory_check`, then `memory_match` or `memory_none`. An unvoted match is shown but does not shortcut; normal FAISS search still runs. A supported, current answer with enough strong upvotes may be reused. Multiple upvoted variants are synthesized from their currently cited chunks and judged again.
+The query is embedded for memory matching. The matcher checks up to 500 newest feedback rows in the same document scope and compares against stored embeddings for up to 100 recent distinct questions. Old history rows without embeddings are filled in the first time they are used. It emits `memory_check`, then `memory_match` or `memory_none`. An unvoted match is shown but does not shortcut; normal FAISS search still runs. A supported, current answer with enough strong upvotes may be reused. Multiple upvoted variants are synthesized from their currently cited chunks and judged again.
 
 ### Trace F — corpus changed since feedback
 
@@ -297,14 +297,14 @@ Every candidate answer source is checked against current document version, chunk
 | Memory embedding failure | Log unavailable and continue to graph. | Normal RAG if retrieval embedding works. |
 | Retrieval embedding fails | Set error; route to safe response. | Unverified response. |
 | FAISS vector lacks metadata | Drop hit. | Use other mapped chunks. |
-| Filter matches no chunks | Empty results may retry. | Eventually insufficient; empty-index fast path is recommended. |
+| Empty index or filter has no indexed chunks | Stop before query rewrite and FAISS search. | Insufficient evidence without model retries. |
 | Judge omits grade | Treat as judge failure. | Safe response. |
 | No relevant chunks | Retry until budget exhausted. | Insufficient evidence. |
 | Blank generation output | Treat as generation error. | Safe response. |
 | Invalid score type/range | Reject evaluation output. | Safe response. |
 | One dimension under threshold | Per-dimension gate fails even if overall high. | Regenerate once, else safe. |
-| Unsupported list non-empty but scores pass | Current numeric pass can still succeed. | Define explicit unsupported-claim policy. |
-| Client disconnect during SSE | Worker has no cancellation signal. | Work may continue; cancellation is a roadmap item. |
+| Unsupported list non-empty but scores pass | Treat evaluation as failed and include claims in correction feedback. | Regenerate once; otherwise use safe response. |
+| Client disconnect during SSE | A cancellation event stops work between graph steps and closes an active model stream. | A blocking non-stream model request may run until its timeout; the graph then stops before its next step. |
 | No session ID | Exchange is not persisted; feedback verification cannot locate it. | No persistent experience memory for that request. |
 
 ## 6. Feedback memory and cached-answer rules
@@ -319,10 +319,11 @@ Cosine similarity is not a probability. Lower thresholds find more paraphrases b
 ### Positive feedback flow
 
 1. Feedback is accepted only for an exchange the server can verify in that session.
-2. Server computes question embedding and stores answer, confidence, server-owned sources, version/hash, corpus fingerprint, scope, and rating.
-3. At query time, only passed upvotes with non-empty current sources are candidates.
-4. At least three strong direct votes for one answer/source signature can reuse that answer.
-5. If three or more votes span distinct answer groups, or matches are broader semantic matches, a lightweight model synthesizes against current chunks and the judge verifies.
+2. The server allows one vote for each session/question/answer combination. A repeated submission updates the rating instead of adding another vote; existing duplicate rows are reduced to the newest rating during migration.
+3. Server computes the question embedding and stores answer, confidence, server-owned sources, version/hash, corpus fingerprint, scope, and rating.
+4. At query time, only passed upvotes with non-empty current sources are candidates.
+5. At least three strong direct votes for one answer/source signature can reuse that answer.
+6. If three or more votes span distinct answer groups, or matches are broader semantic matches, a lightweight model synthesizes against current chunks and the judge verifies.
 
 Votes are preference signals, not evidence. Current documentation remains the synthesis evidence and the evaluator is the final gate.
 
@@ -335,8 +336,9 @@ Product tradeoff: a downvote may mean poor phrasing, not absent evidence. Suppre
 ### Limitations
 
 - History display includes at most 100 newest distinct stored questions.
-- That history is re-embedded on each query; simple for a small assignment but not scalable.
-- Feedback rows are loaded as a full list. The server does not prevent a repeated submission from counting as another vote.
+- Feedback matching checks at most 500 newest rows.
+- Old history rows without embeddings are embedded and saved the first time they are compared; new exchanges save their question embedding.
+- One vote is counted per session, normalized question, and answer hash. There is no user identity, so separate sessions can still produce separate votes.
 - Matching is document-scope-sensitive: feedback saved under a different `document_ids` scope is not eligible.
 - Version/hash checks prevent stale cache use; popularity never overrides source freshness.
 
@@ -346,22 +348,21 @@ Product tradeoff: a downvote may mean poor phrasing, not absent evidence. Suppre
 POST /query {stream:true}
 Content-Type: text/event-stream
 event: stage        {stage, detail, optional matches[]}
-event: draft_token  {text}        # emitted while evaluator has not approved yet
-event: reset_draft                 # clear partial text after fallback/regeneration
-event: token         {text}        # direct cached-answer chunks
+event: reset_draft                 # internal stream fallback/regeneration reset
+event: token         {text}        # emitted only after answer is approved
 event: result        {response}    # authoritative final JSON response
 event: error         {message}
 ```
 
 `query_stream()` starts a daemon worker thread. The worker publishes to a queue and the endpoint yields SSE frames. `streamQuestion()` parses frames, updates the current step, appends text, clears text on reset, and completes only after `result`. The progress `<details>` disclosure is closed by default. It shows current step; expansion shows prior steps and similar questions. `App.jsx` clears progress on success/error, and `ChatMessage` only renders it while the message is streaming.
 
-Example event sequence: `memory_check → memory_match → query_analysis → retrieval → source_review → generation → draft_token… → evaluation → approved → result`. If evaluation fails, `reset_draft` may clear the draft and the final answer becomes the safe response.
+Example event sequence: `memory_check → memory_match → query_analysis → retrieval → source_review → generation → evaluation → approved → token… → result`. If evaluation fails, no answer text has been sent; the graph retries once or returns the safe response. The final answer still arrives in multiple token events, but only after it passes.
 
-> **Streaming contract:** result is authoritative. Text arriving before result is a draft. The UI labels it as pending verification, but users have already seen the text. If strict approved-only output is required, buffer server-side until the answer passes, then stream the approved text.
+> **Streaming contract:** progress arrives while processing. Answer tokens arrive only after evaluation approves the complete answer. The final `result` event remains authoritative and contains the same answer.
 
 ## 8. Model fallback, confidence, and safe responses
 
-Generation and judge models are configured independently. `GeminiClient` deduplicates model names and tries the next configured model only for rate limits and temporary service outages. Permanent request failures do not trigger fallback. JSON is parsed and node-specific fields are validated.
+Generation and judge models are configured independently. `GeminiClient` deduplicates model names and tries the next configured model only for rate limits and temporary service outages. If both roles use the same primary model, their fallback lists are merged in generation-first, judge-second order. Permanent request failures do not trigger fallback. JSON is parsed and node-specific fields are validated.
 
 Example output:
 
@@ -381,7 +382,7 @@ Example output:
 }
 ```
 
-These values are judge scores and a weighted aggregate, not calibrated probabilities. Unverified and insufficient responses return null score values rather than inventing confidence.
+These values are evaluator scores and a weighted aggregate, not calibrated probabilities. Unverified and insufficient responses return null score values rather than inventing confidence.
 
 | Status | Typical cause | Returned behavior |
 |---|---|---|
@@ -399,45 +400,40 @@ These values are judge scores and a weighted aggregate, not calibrated probabili
 | Cached response not used | rating/status, vote count, similarity, source versions/hashes | Any stale/missing source disqualifies it. |
 | Repeated search | retry_count, rewritten_query, retrieved/relevant counts | Rewrite failure can reuse the same query; loop is bounded. |
 | Chunks retrieved but no answer | grading result and judge schema | Retrieved does not mean relevant; all may be rejected. |
-| Draft appears and disappears | draft_token, reset_draft, evaluation, result status | Draft was shown before judge approval and then replaced. |
+| No answer text until late in the request | stage events, evaluation, approved, token events | Expected: answer text is buffered until the evaluator approves it. |
 | Null confidence | terminal status and evaluation error | Expected on insufficient evidence or judge outage. |
 
 Useful log events: `query_pipeline_started`, `http_request_started`, `graph_node_started/completed`, `gemini_request_started/completed`, `gemini_model_fallback`, and `feedback_shortcut_applied`. Correlate with `request_id`. Current logging avoids prompts, document text, and keys.
 
-## 10. Review findings and improvement roadmap
+## 10. Review fixes and remaining limits
 
-### Fixed during this review
+The findings below were fixed without changing the normal retrieval-generation-evaluation order. The feedback-memory path stays before the graph, and the API response shape stays the same.
 
-| Finding | Impact | Change | Verification |
-|---|---|---|---|
-| Matcher returned early when feedback table was empty, so unvoted history questions were never compared or shown. | UI could report no memory although prior conversations existed. | Removed early return; history matching runs independently of feedback. | Added `test_prior_question_memory_is_checked_without_feedback`; suite passes. |
-| Existing feedback API test sent a question different from the stored exchange and omitted the answer. | Correct server verification returned 409; test payload was stale. | Updated it to submit exact question and returned answer. | Backend suite passes. |
+| Earlier finding | Change made | Test coverage |
+|---|---|---|
+| Answer text was sent before evaluation passed. | Generation text stays in a server buffer. After the graph approves the complete answer, the server sends it in token events and then sends the final result. Failed drafts are not sent as answer text. | test_streaming_sends_answer_only_after_evaluation_approves_it; test_stream_fallback_resets_partial_model_output_without_emitting_draft |
+| Repeated feedback could count several times for the same answer in one session. | A unique key uses session, normalized question, and answer hash. Repeating a vote updates the existing row; startup keeps the newest duplicate from old data. | test_feedback_submission_updates_existing_vote_instead_of_counting_twice; test_store_migration_keeps_newest_of_legacy_duplicate_votes |
+| A judge could list unsupported claims and still pass on numeric scores. | Any non-empty unsupported_claims forces failure and is included in correction feedback. | test_unsupported_claim_forces_regeneration_even_with_high_scores |
+| Follow-up evaluation saw only the short original wording. | Evaluation now receives both the original and resolved standalone questions. | Follow-up test checks that both question forms reach the evaluator. |
+| Shared primary model names could overwrite one fallback list. | Fallback lists are merged in stable order with duplicates removed. | Test exercises merged chains through GeminiClient.generate() with a fake transport. |
+| History questions were re-embedded on every query and feedback reads were unbounded. | Store history embeddings, backfill older rows once, compare the 100 newest distinct questions, and cap feedback reads at 500 rows. | Memory test checks stored vectors are reused; bounded-read test checks the limit. |
+| SSE worker ignored client disconnects. | A cancellation event stops work between graph steps and closes an active generation stream. | test_sse_disconnect_stops_before_retrieval_after_current_model_call |
+| Empty index spent model calls on query rewrites. | Check the selected document scope before query rewriting. If there are no indexed chunks, return insufficient evidence without Gemini or FAISS calls. | test_empty_index_skips_rewrite_and_retrieval_retries |
+| README threshold and source examples did not match the application. | Updated streaming behavior, both similarity thresholds, the source example, and the feedback request example. | Compared documented values and fields with runtime configuration and response data. |
+| Cache freshness and streaming branches lacked coverage. | Added checks for changed chunk hashes, fallback resets, approved token ordering over both the service stream and FastAPI route, vote updates, and model fallback selection. | test_feedback_answer_cache_is_rejected_when_source_chunk_changes; test_fastapi_sse_streams_only_approved_answer_text; related tests above. |
 
-### Open findings
+**Remaining limits:** a blocking, non-stream model request cannot be interrupted mid-request after the browser disconnects. It finishes or times out, then the cancellation event stops the next graph step. There is no authenticated user identity; one session can only vote once per answer, but a person can create another session. Gemini was not called live in tests; fallback behavior was checked with a fake transport to avoid network and quota dependence.
 
-| Priority | Finding | Why it matters | Recommendation |
-|---|---|---|---|
-| P1 — trust | `draft_token` is published by generation before evaluation passes. | Unsupported text can be seen before it is rejected; reset/final replacement happens later. | Decide between approved-only buffered streaming and explicitly visible draft streaming; keep UI and API contract aligned. |
-| P1 — feedback integrity | `/feedback` inserts a row each time; it does not prevent duplicate vote submissions. | Repeated submissions can reach the three-vote shortcut threshold. | Add a unique session/question/answer key and define how a changed vote should work. |
-| P2 — evaluator | `unsupported_claims` is validated/returned but does not independently veto a numeric pass. | Judge may list unsupported claims and still pass. | Explicitly reject or reconcile claims. |
-| P2 — follow-up evaluation | Generation uses `standalone_query`, while answer evaluation scores against `original_query` only. | For follow-ups like “what about async?”, evaluation may see a question without the subject resolved from chat history. | Give evaluation the original and resolved questions, plus relevant history, and specify which wording to score. |
-| P2 — fallback configuration | Fallbacks are keyed by primary model name. If `GENERATION_MODEL` and `JUDGE_MODEL` are configured to the same model with different chains, the dictionary entry for the later role overwrites the earlier chain. | One role can silently use the other role's fallback list. | Merge chains deterministically or validate that shared primary models use the same chain. |
-| P2 — memory scaling | Every query re-embeds up to 100 history questions; all feedback rows are read. | Latency and work grow with history/votes. | Persist question embeddings; bound feedback reads/retention or add a nearest-neighbor store. |
-| P2 — SSE lifecycle | Daemon query thread has no client-disconnect cancellation. | Expensive work may continue after browser stops listening. | Pass a cancellation event through model/retrieval iteration. |
-| P2 — empty corpus | Empty index can consume rewrite retries. | Adds model calls despite no possible evidence. | Detect no indexed chunks before graph retries. |
-| P2 — documentation drift | README still says threshold 0.92 and shows an S1 source label not emitted by current source list. | Setup and response examples disagree with runtime. | Update README defaults/schema examples. |
-| P3 — test coverage | Tests do not cover SSE resets, shortcut freshness invalidation, duplicate votes, or real fallback chains. | Important branches may regress. | Add focused fake-based tests and one SSE integration test. |
-
-**Where to start in the code:** streaming drafts: `retrieval/service.py` (`_stream_model_answer`, `_generation`) and `frontend/src/App.jsx`; feedback recording: `app.py` (`feedback`) and `retrieval/store.py` (`save_feedback`); evaluation rules: `retrieval/service.py` (`_answer_evaluation`); model-chain setup: `retrieval/service.py` (`RAGService.__init__`); history matching: `retrieval/service.py` (`_feedback_shortcut`); query worker: `retrieval/service.py` (`query_stream`).
-
-Suggested order: (1) make votes idempotent; (2) choose streaming contract; (3) define unsupported-claim policy; (4) add empty-corpus short-circuit and edge tests; (5) persist embeddings/add SSE cancellation; (6) refresh README.
+**Where to start in the code:** answer buffering and cancellation are in retrieval/service.py (_stream_model_answer, _generation, query_stream) and frontend state in frontend/src/App.jsx; vote uniqueness and saved vectors are in retrieval/store.py; evaluator rules are in retrieval/service.py (_answer_evaluation) and retrieval/prompts.py; fallback merging is in RAGService.__init__; empty-index handling is in _query_analysis and _retrieval; request examples are in README.md.
 
 ## 11. Test results and source map
 
 ### Verification performed
 
 Command: `.venv\Scripts\python.exe -m pytest -q`  
-Result: **14 passed**. This includes the no-feedback conversation-memory regression check and the corrected feedback endpoint request. No live Gemini integration test was run; scripted clients are used in unit tests.
+Result: **25 passed**. Tests cover graph branches, feedback memory, vote updates and legacy migration, source freshness, unsupported-claim handling, follow-up evaluation, empty-index behavior, approved token delivery through the service and HTTP SSE route, stream cancellation, and fallback chains. No live Gemini integration test was run; tests use scripted models or a fake provider transport.
+
+Frontend verification: `npm run build` completed successfully with Vite.
 
 ### Source map
 

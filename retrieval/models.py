@@ -29,4 +29,6 @@ class RAGState(TypedDict, total=False):
     should_regenerate: bool
     stream_output: bool
     progress_callback: Any
+    cancel_event: Any
+    search_scope_empty: bool
 

@@ -20,7 +20,8 @@ class AppStore:
         self.connection.executescript("""
             CREATE TABLE IF NOT EXISTS conversation_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-                role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, metadata_json TEXT
+                role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, metadata_json TEXT,
+                question_embedding TEXT
             );
             CREATE INDEX IF NOT EXISTS ix_conversation_session ON conversation_messages(session_id, id);
             CREATE TABLE IF NOT EXISTS feedback (
@@ -46,6 +47,23 @@ class AppStore:
         message_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(conversation_messages)")}
         if "metadata_json" not in message_columns:
             self.connection.execute("ALTER TABLE conversation_messages ADD COLUMN metadata_json TEXT")
+        if "question_embedding" not in message_columns:
+            self.connection.execute("ALTER TABLE conversation_messages ADD COLUMN question_embedding TEXT")
+        # Keep the newest rating when older app versions recorded the same vote more than once.
+        self.connection.execute("""
+            DELETE FROM feedback
+            WHERE session_id IS NOT NULL AND normalized_question IS NOT NULL AND answer_hash IS NOT NULL
+              AND rowid NOT IN (
+                SELECT MAX(rowid) FROM feedback
+                WHERE session_id IS NOT NULL AND normalized_question IS NOT NULL AND answer_hash IS NOT NULL
+                GROUP BY session_id, normalized_question, answer_hash
+              )
+        """)
+        self.connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_feedback_session_question_answer
+            ON feedback(session_id, normalized_question, answer_hash)
+            WHERE session_id IS NOT NULL AND normalized_question IS NOT NULL AND answer_hash IS NOT NULL
+        """)
         self.connection.commit()
 
     def history(self, session_id: str | None, max_turns: int = 8) -> list[dict[str, str]]:
@@ -59,24 +77,45 @@ class AppStore:
 
     def recent_questions(self, limit: int = 100) -> list[str]:
         """Return distinct questions from prior conversations, newest first."""
+        return [record["question"] for record in self.recent_question_records(limit)]
+
+    def recent_question_records(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return recent distinct questions and any stored embedding."""
         rows = self.connection.execute(
-            """SELECT content, MAX(id) AS latest_id FROM conversation_messages
-               WHERE role='user' AND TRIM(content) != ''
-               GROUP BY content COLLATE NOCASE ORDER BY latest_id DESC LIMIT ?""",
+            """SELECT message.id, message.content, message.question_embedding
+               FROM conversation_messages AS message
+               JOIN (
+                 SELECT MAX(id) AS latest_id FROM conversation_messages
+                 WHERE role='user' AND TRIM(content) != ''
+                 GROUP BY content COLLATE NOCASE
+               ) AS latest ON latest.latest_id = message.id
+               ORDER BY message.id DESC LIMIT ?""",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-        return [str(row["content"]) for row in rows]
+        return [{"id": row["id"], "question": str(row["content"]),
+                 "question_embedding": json.loads(row["question_embedding"]) if row["question_embedding"] else None}
+                for row in rows]
+
+    def store_question_embedding(self, message_id: int, embedding: list[float]) -> None:
+        with self.connection:
+            self.connection.execute("UPDATE conversation_messages SET question_embedding=? WHERE id=? AND role='user'",
+                                    (json.dumps(embedding), message_id))
 
     def save_exchange(self, session_id: str | None, question: str, answer: str,
-                      metadata: dict[str, Any] | None = None) -> None:
+                      metadata: dict[str, Any] | None = None,
+                      question_embedding: list[float] | None = None) -> None:
         if not session_id:
             return
         now = utc_now()
         with self.connection:
             self.connection.executemany(
-                "INSERT INTO conversation_messages(session_id, role, content, created_at, metadata_json) VALUES (?, ?, ?, ?, ?)",
-                [(session_id, "user", question, now, None),
-                 (session_id, "assistant", answer, now, json.dumps(metadata) if metadata is not None else None)],
+                """INSERT INTO conversation_messages
+                   (session_id, role, content, created_at, metadata_json, question_embedding)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [(session_id, "user", question, now, None,
+                  json.dumps(question_embedding) if question_embedding is not None else None),
+                 (session_id, "assistant", answer, now,
+                  json.dumps(metadata) if metadata is not None else None, None)],
             )
 
     def verified_exchange(self, session_id: str | None, question: str, answer: str) -> dict[str, Any] | None:
@@ -115,17 +154,31 @@ class AppStore:
                     feedback_id, session_id, question, rating, comment, created_at,
                     normalized_question, question_embedding, answer, answer_hash,
                     confidence_json, sources_json, corpus_fingerprint, scope_json, response_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, normalized_question, answer_hash)
+                WHERE session_id IS NOT NULL AND normalized_question IS NOT NULL AND answer_hash IS NOT NULL
+                DO UPDATE SET rating=excluded.rating, comment=excluded.comment, created_at=excluded.created_at,
+                    question_embedding=excluded.question_embedding, answer=excluded.answer,
+                    confidence_json=excluded.confidence_json, sources_json=excluded.sources_json,
+                    corpus_fingerprint=excluded.corpus_fingerprint, scope_json=excluded.scope_json,
+                    response_status=excluded.response_status""",
                 (feedback_id, session_id, question, rating, comment, created_at,
                  normalized, json.dumps(question_embedding) if question_embedding is not None else None,
                  answer, answer_hash, json.dumps(confidence) if confidence is not None else None,
                  json.dumps(sources or []), corpus_fingerprint,
                  json.dumps(sorted(document_ids)) if document_ids is not None else "[]", response_status),
             )
-        return {"feedback_id": feedback_id, "status": "recorded", "created_at": created_at}
+            saved = self.connection.execute(
+                """SELECT feedback_id FROM feedback WHERE session_id=? AND normalized_question=? AND answer_hash=?""",
+                (session_id, normalized, answer_hash),
+            ).fetchone() if session_id and answer_hash else None
+        return {"feedback_id": saved["feedback_id"] if saved else feedback_id,
+                "status": "recorded" if not saved or saved["feedback_id"] == feedback_id else "updated",
+                "created_at": created_at}
 
-    def feedback_entries(self) -> list[dict[str, Any]]:
-        rows = self.connection.execute("SELECT * FROM feedback ORDER BY created_at DESC, rowid DESC").fetchall()
+    def feedback_entries(self, limit: int = 500) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT * FROM feedback ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                                       (max(1, min(int(limit), 2000)),)).fetchall()
         entries = []
         for row in rows:
             item = dict(row)

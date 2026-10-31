@@ -25,7 +25,7 @@ Question: {question}
 Documentation excerpts:
 {documents}"""
 
-EVALUATION_PROMPT = """Evaluate the draft answer only against the provided evidence and original question.
+EVALUATION_PROMPT = """Evaluate the draft answer against the provided evidence and both question forms. Use the resolved standalone question to understand short follow-ups, while checking that the answer still addresses the user's original intent.
 Return JSON only with this shape:
 {{\"faithfulness\": {{\"score\": integer 0-100, \"reason\": string}},
  \"relevance\": {{\"score\": integer 0-100, \"reason\": string}},
@@ -34,6 +34,7 @@ Return JSON only with this shape:
 Faithfulness means claims are supported by evidence. Relevance means it answers the question directly.
 Correctness means it is consistent with the evidence. Identify concrete unsupported claims.
 
-Question: {question}
+Original user question: {question}
+Resolved standalone question: {standalone_query}
 Draft answer: {answer}
 Evidence: {documents}"""
