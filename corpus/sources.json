@@ -1,0 +1,22 @@
+[
+  {
+    "id": "fastapi:first-steps",
+    "title": "FastAPI First Steps",
+    "url": "https://fastapi.tiangolo.com/tutorial/first-steps/"
+  },
+  {
+    "id": "fastapi:path-parameters",
+    "title": "FastAPI Path Parameters",
+    "url": "https://fastapi.tiangolo.com/tutorial/path-params/"
+  },
+  {
+    "id": "fastapi:request-body",
+    "title": "FastAPI Request Body",
+    "url": "https://fastapi.tiangolo.com/tutorial/body/"
+  },
+  {
+    "id": "fastapi:dependencies",
+    "title": "FastAPI Dependencies",
+    "url": "https://fastapi.tiangolo.com/tutorial/dependencies/"
+  }
+]
