@@ -35,6 +35,12 @@ export async function askQuestion({ question, sessionId }) {
 
 const STREAM_STAGE_LABELS = {
   started: 'Starting the documentation assistant',
+  memory_check: 'Checking previous questions',
+  memory_match: 'Similar previous questions found',
+  memory_none: 'No similar previous questions found',
+  memory_unavailable: 'Previous-question matching unavailable',
+  feedback_synthesis: 'Preparing an answer from helpful past responses',
+  feedback_shortcut: 'Using a version-checked past answer',
   query_analysis: 'Understanding the question',
   retrieval: 'Searching indexed documentation',
   source_review: 'Checking retrieved sources for relevance',
@@ -42,7 +48,7 @@ const STREAM_STAGE_LABELS = {
   generation: 'Drafting an answer from relevant sources',
   evaluation: 'Verifying the draft against documentation',
   answer_retry: 'Revising the draft using verification feedback',
-  approved: 'Answer approved — streaming response',
+  approved: 'Draft approved by verification',
   unverified: 'Verification failed — preparing a safe response',
   insufficient_evidence: 'No sufficiently relevant documentation found',
 }
@@ -50,11 +56,11 @@ const STREAM_STAGE_LABELS = {
 export async function streamQuestion({ question, sessionId, onStage, onToken }) {
   const baseURL = api.defaults.baseURL
   const startedAt = performance.now()
-  if (debug) console.info('[DocuMind API] → POST /query/stream')
-  const response = await fetch(`${baseURL}/query/stream`, {
+  if (debug) console.info('[DocuMind API] → POST /query (stream)')
+  const response = await fetch(`${baseURL}/query`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-    body: JSON.stringify({ question, session_id: sessionId }),
+    body: JSON.stringify({ question, session_id: sessionId, stream: true }),
   })
   if (!response.ok) {
     let body = {}
@@ -78,7 +84,8 @@ export async function streamQuestion({ question, sessionId, onStage, onToken }) 
     if (!data.length) return
     const payload = JSON.parse(data.join('\n'))
     if (eventName === 'stage') onStage?.({ ...payload, label: STREAM_STAGE_LABELS[payload.stage] || payload.detail })
-    if (eventName === 'token') onToken?.(payload.text || '')
+    if (eventName === 'token' || eventName === 'draft_token') onToken?.(payload.text || '')
+    if (eventName === 'reset_draft') onToken?.(null)
     if (eventName === 'result') result = payload.response
     if (eventName === 'error') throw new Error(payload.message || 'The query could not be completed.')
   }
@@ -98,7 +105,7 @@ export async function streamQuestion({ question, sessionId, onStage, onToken }) 
   } finally {
     reader.releaseLock()
   }
-  if (debug) console.info(`[DocuMind API] ← ${response.status} /query/stream (${Math.round(performance.now() - startedAt)} ms)`)
+  if (debug) console.info(`[DocuMind API] ← ${response.status} /query (${Math.round(performance.now() - startedAt)} ms)`)
   if (!result) throw new Error('The response stream ended before the answer was complete.')
   return result
 }
@@ -126,13 +133,21 @@ export async function ingestUrl(url) {
   return data
 }
 
-export async function submitFeedback({ question, sessionId, rating, comment }) {
+export async function submitFeedback({ question, sessionId, rating, answer, confidence, sources, status }) {
   const { data } = await api.post('/feedback', {
     question,
     session_id: sessionId,
     rating,
-    comment: comment || null,
+    answer: answer || '',
+    confidence: confidence || null,
+    sources: sources || [],
+    response_status: status || null,
   })
+  return data
+}
+
+export async function deleteConversation(sessionId) {
+  const { data } = await api.delete(`/sessions/${encodeURIComponent(sessionId)}`)
   return data
 }
 

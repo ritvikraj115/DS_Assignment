@@ -1,10 +1,10 @@
 import { useState } from 'react'
 import {
-  BookOpenText, ChevronRight, Clock3, FileText, MessageSquarePlus,
+  BookOpenText, ChevronRight, Clock3, FileText, MessageSquarePlus, Trash2,
   PanelLeftClose, PanelLeftOpen, Settings2, Sparkles,
 } from 'lucide-react'
 
-export default function Sidebar({ page, setPage, chats, activeChatId, onNewChat, onSelectChat }) {
+export default function Sidebar({ page, setPage, chats, activeChatId, onNewChat, onSelectChat, onDeleteChat }) {
   const [collapsed, setCollapsed] = useState(false)
   const navItems = [
     { id: 'chat', label: 'Assistant', icon: Sparkles },
@@ -40,10 +40,13 @@ export default function Sidebar({ page, setPage, chats, activeChatId, onNewChat,
         <div className="history-heading"><span>CHAT HISTORY</span><Clock3 size={14} /></div>
         <div className="history-list">
           {chats.length === 0 ? <p className="history-empty">Your conversations will appear here.</p> : chats.map((chat) => (
-            <button key={chat.id} className={`history-item ${activeChatId === chat.id && page === 'chat' ? 'history-item-active' : ''}`} onClick={() => onSelectChat(chat.id)}>
-              <span className="history-dot" /><span className="history-title">{chat.title || 'New conversation'}</span>
-              {activeChatId === chat.id && <ChevronRight size={14} className="history-chevron" />}
-            </button>
+            <div key={chat.id} className="history-entry">
+              <button className={`history-item ${activeChatId === chat.id && page === 'chat' ? 'history-item-active' : ''}`} onClick={() => onSelectChat(chat.id)}>
+                <span className="history-dot" /><span className="history-title">{chat.title || 'New conversation'}</span>
+                {activeChatId === chat.id && <ChevronRight size={14} className="history-chevron" />}
+              </button>
+              <button className="history-delete" aria-label={`Delete ${chat.title || 'conversation'}`} title="Delete conversation" onClick={() => onDeleteChat(chat.id)}><Trash2 size={13} /></button>
+            </div>
           ))}
         </div>
       </div>}

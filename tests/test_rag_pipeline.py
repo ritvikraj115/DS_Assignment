@@ -232,6 +232,23 @@ def test_feedback_is_stored_separately(tmp_path):
     assert store.history("session-1") == []
 
 
+def test_prior_question_memory_is_checked_without_feedback(tmp_path):
+    store = AppStore(tmp_path / "app.sqlite3")
+    store.save_exchange("session-1", "How does FastAPI declare dependencies?", "They use Depends.")
+    rag, _, _ = make_rag(app_store=store)
+    events = []
+
+    result = rag._feedback_shortcut(
+        "How does FastAPI declare dependencies?", "session-2", None,
+        progress_callback=events.append,
+    )
+
+    assert result is None
+    match_event = next(event for event in events if event["stage"] == "memory_match")
+    assert match_event["matches"][0]["question"] == "How does FastAPI declare dependencies?"
+    assert match_event["matches"][0]["rating"] is None
+
+
 def test_fastapi_health_query_documents_and_feedback_endpoints(tmp_path):
     from fastapi.testclient import TestClient
     from app import create_app
@@ -250,7 +267,10 @@ def test_fastapi_health_query_documents_and_feedback_endpoints(tmp_path):
     docs = client.get("/documents").json()["documents"]
     assert docs[0]["filename"] == "fastapi_dependencies.md"
     assert "chunks" not in docs[0]
-    feedback_response = client.post("/feedback", json={"question": "Was that useful?", "rating": "up", "session_id": "api-session"})
+    feedback_response = client.post("/feedback", json={
+        "question": "How does FastAPI declare dependencies?", "rating": "up", "session_id": "api-session",
+        "answer": query_response.json()["answer"],
+    })
     assert feedback_response.status_code == 200
     assert feedback_response.json()["status"] == "recorded"
     assert len(store.history("api-session")) == 2

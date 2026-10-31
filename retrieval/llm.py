@@ -38,7 +38,7 @@ def _provider_error_category(exc: Exception) -> tuple[str, int | None]:
 
 class ModelClient(Protocol):
     def generate(self, model: str, prompt: str, *, json_mode: bool = False) -> str: ...
-    def generate_stream(self, model: str, prompt: str) -> Iterator[str]: ...
+    def generate_stream(self, model: str, prompt: str, *, on_fallback=None) -> Iterator[str]: ...
 
 
 class GeminiClient:
@@ -89,7 +89,12 @@ class GeminiClient:
             response = self.client.models.generate_content(model=model, contents=prompt, config=config)
             text = getattr(response, "text", None)
             if not text:
-                raise ModelError("Gemini returned an empty response")
+                raise ModelError("Gemini returned an empty response", retryable=True)
+            if json_mode:
+                try:
+                    parse_json_response(text)
+                except ModelError as exc:
+                    raise ModelError("Gemini returned invalid structured output", retryable=True) from exc
             log.info("gemini_request_completed model=%s json_mode=%s response_chars=%s duration_ms=%.1f",
                      model, json_mode, len(text), (perf_counter() - started) * 1000)
             return text.strip()
@@ -108,20 +113,19 @@ class GeminiClient:
             raise ModelError(f"Gemini {category}: {type(exc).__name__}",
                              retryable=category in {"rate limit", "temporary service outage"}) from exc
 
-    def generate_stream(self, model: str, prompt: str) -> Iterator[str]:
+    def generate_stream(self, model: str, prompt: str, *, on_fallback=None) -> Iterator[str]:
         candidates = self._candidate_models(model)
         for index, candidate in enumerate(candidates):
-            # Buffer each attempt so a partial failed stream is never mixed with fallback text.
-            pieces: list[str] = []
             try:
-                pieces.extend(self._generate_stream_once(candidate, prompt))
+                yield from self._generate_stream_once(candidate, prompt)
                 if candidate != model:
                     log.info("gemini_stream_fallback_succeeded primary=%s fallback=%s", model, candidate)
-                yield from pieces
                 return
             except ModelError as exc:
                 if not self._fallback_allowed(exc, candidate, candidates):
                     raise
+                if on_fallback:
+                    on_fallback()
                 log.warning("gemini_stream_fallback primary=%s failed=%s fallback=%s category=%s",
                             model, candidate, candidates[index + 1], str(exc))
 
@@ -130,11 +134,17 @@ class GeminiClient:
         log.info("gemini_stream_started model=%s prompt_chars=%s", model, len(prompt))
         try:
             config = self.types.GenerateContentConfig(response_mime_type="text/plain", temperature=0.2)
+            received_text = False
             for response in self.client.models.generate_content_stream(model=model, contents=prompt, config=config):
                 text = getattr(response, "text", None)
                 if text:
+                    received_text = True
                     yield text
+            if not received_text:
+                raise ModelError("Gemini returned an empty stream", retryable=True)
             log.info("gemini_stream_completed model=%s duration_ms=%.1f", model, (perf_counter() - started) * 1000)
+        except ModelError:
+            raise
         except Exception as exc:
             category, status = _provider_error_category(exc)
             if category == "temporary service outage":

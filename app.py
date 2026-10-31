@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
+import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import perf_counter
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-import json
 
 from ingestion.config import IngestionConfig
 from ingestion.metadata import MetadataStore
@@ -29,6 +30,7 @@ class QueryRequest(BaseModel):
     session_id: str | None = Field(default=None, max_length=128)
     document_ids: list[str] | None = Field(default=None, max_length=100)
     top_k: int | None = Field(default=None, ge=1, le=100)
+    stream: bool = False
 
 
 class FeedbackRequest(BaseModel):
@@ -36,6 +38,11 @@ class FeedbackRequest(BaseModel):
     rating: Literal["up", "down"]
     session_id: str | None = Field(default=None, max_length=128)
     comment: str | None = Field(default=None, max_length=2000)
+    answer: str = Field(default="", max_length=40000)
+    confidence: dict[str, Any] | None = None
+    sources: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    response_status: str | None = Field(default=None, max_length=40)
+    document_ids: list[str] | None = Field(default=None, max_length=100)
 
 
 def create_app(rag_service: RAGService | None = None, ingestion_service: IngestionService | None = None,
@@ -96,6 +103,17 @@ def create_app(rag_service: RAGService | None = None, ingestion_service: Ingesti
             if len(question) < 2:
                 raise HTTPException(status_code=422, detail="question must contain at least two non-whitespace characters")
             log.info("query_pipeline_started request_id=%s session_id=%s", http_request.state.request_id, request.session_id or "new")
+            if request.stream or "text/event-stream" in http_request.headers.get("accept", ""):
+                request_id = http_request.state.request_id
+
+                def event_stream():
+                    for event in rag.query_stream(question, request.session_id, document_ids=request.document_ids,
+                                                  top_k=request.top_k, request_id=request_id):
+                        event_name = event.pop("type")
+                        yield f"event: {event_name}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+                return StreamingResponse(event_stream(), media_type="text/event-stream",
+                                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
             response = rag.query(question, request.session_id, document_ids=request.document_ids,
                                  top_k=request.top_k, request_id=http_request.state.request_id)
             log.info("query_pipeline_completed request_id=%s status=%s retries=%s generation_retries=%s",
@@ -110,33 +128,6 @@ def create_app(rag_service: RAGService | None = None, ingestion_service: Ingesti
             raise HTTPException(status_code=503, detail="The query service is temporarily unavailable") from exc
         except Exception as exc:
             log.exception("Query failed")
-            raise HTTPException(status_code=500, detail="Query failed") from exc
-
-    @app.post("/query/stream")
-    def query_stream(http_request: Request, request: QueryRequest):
-        try:
-            rag, _, _ = runtime(require_ingestion=True, require_rag=True)
-            question = request.question.strip()
-            if len(question) < 2:
-                raise HTTPException(status_code=422, detail="question must contain at least two non-whitespace characters")
-            request_id = http_request.state.request_id
-            log.info("query_stream_started request_id=%s session_id=%s", request_id, request.session_id or "new")
-
-            def event_stream():
-                for event in rag.query_stream(question, request.session_id, document_ids=request.document_ids,
-                                              top_k=request.top_k, request_id=request_id):
-                    event_name = event.pop("type")
-                    yield f"event: {event_name}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-            return StreamingResponse(event_stream(), media_type="text/event-stream",
-                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-        except HTTPException:
-            raise
-        except (ValueError, RuntimeError) as exc:
-            log.exception("Streaming query service unavailable")
-            raise HTTPException(status_code=503, detail="The query service is temporarily unavailable") from exc
-        except Exception as exc:
-            log.exception("Could not start streaming query")
             raise HTTPException(status_code=500, detail="Query failed") from exc
 
     @app.post("/ingest")
@@ -191,13 +182,45 @@ def create_app(rag_service: RAGService | None = None, ingestion_service: Ingesti
     @app.post("/feedback")
     def feedback(request: FeedbackRequest):
         try:
-            _, _, store = runtime()
-            result = store.save_feedback(request.session_id, request.question.strip(), request.rating, request.comment)
+            _, ingestion, store = runtime(require_ingestion=True)
+            question = request.question.strip()
+            verified = store.verified_exchange(request.session_id, question, request.answer)
+            if not verified:
+                raise HTTPException(status_code=409, detail="Feedback must refer to an answer from this conversation")
+            documents = ingestion.metadata.list_documents()
+            scoped = documents if request.document_ids is None else [
+                document for document in documents if document["document_id"] in set(request.document_ids)
+            ]
+            corpus_snapshot = sorted((doc["document_id"], doc.get("version"), doc.get("content_hash")) for doc in scoped)
+            corpus_fingerprint = hashlib.sha256(json.dumps(corpus_snapshot, separators=(",", ":")).encode("utf-8")).hexdigest()
+            vectors = ingestion.embedder.encode([question])
+            if len(vectors) != 1:
+                raise RuntimeError("Could not encode question for semantic feedback matching")
+            # Answer metadata comes from the server-side conversation record, not client-submitted source fields.
+            result = store.save_feedback(
+                request.session_id, question, request.rating, request.comment,
+                answer=request.answer, confidence=verified.get("confidence"), sources=verified.get("sources", []),
+                question_embedding=vectors[0], corpus_fingerprint=corpus_fingerprint,
+                document_ids=request.document_ids, response_status=verified.get("status"),
+            )
             log.info("feedback_recorded feedback_id=%s rating=%s", result["feedback_id"], request.rating)
             return result
+        except HTTPException:
+            raise
         except Exception as exc:
             log.exception("Could not store feedback")
             raise HTTPException(status_code=503, detail="Feedback could not be stored") from exc
+
+    @app.delete("/sessions/{session_id}")
+    def delete_session(session_id: str):
+        try:
+            _, _, store = runtime()
+            store.delete_session(session_id)
+            log.info("conversation_deleted session_id=%s", session_id)
+            return {"status": "deleted", "session_id": session_id}
+        except Exception as exc:
+            log.exception("Could not delete conversation session")
+            raise HTTPException(status_code=503, detail="Conversation could not be deleted") from exc
 
     return app
 

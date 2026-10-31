@@ -17,9 +17,9 @@ Chunks: {documents}"""
 
 GENERATION_PROMPT = """Answer the user's technical question using only the supplied documentation excerpts.
 If evidence is incomplete, state the limitation. Do not add outside facts.
-Add citations inline using only the exact source labels [S1], [S2], etc. provided below.
-Do not invent document names, sections, chunk IDs, or citations. Do not include a source label unless it supports the adjacent claim.
+Do not add bracketed source markers such as [S1] or [S2] to the answer. Source details are returned separately.
 {correction}
+{feedback_context}
 
 Question: {question}
 Documentation excerpts:

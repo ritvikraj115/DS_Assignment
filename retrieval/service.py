@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import re
 from queue import Queue
 from threading import Thread
 from time import perf_counter
@@ -145,7 +147,8 @@ class RAGService:
                 "source_url": doc.get("source_url"), "document_version": doc.get("version"),
                 "section": chunk.get("section", {}).get("title", "Document"),
                 "section_path": chunk.get("section", {}).get("path", []),
-                "chunk_id": chunk["chunk_id"], "vector_id": vector_id, "text": chunk["text"], "similarity": score,
+                "chunk_id": chunk["chunk_id"], "chunk_hash": chunk.get("content_hash"),
+                "vector_id": vector_id, "text": chunk["text"], "similarity": score,
             })
         log.info("graph_node_completed request_id=%s node=retrieval hits=%s retry_count=%s duration_ms=%.1f",
                  state.get("request_id"), len(result), state.get("retry_count", 0), (perf_counter() - started) * 1000)
@@ -207,10 +210,334 @@ class RAGService:
             if key in seen:
                 continue
             seen.add(key)
-            sources.append({"label": f"S{len(sources) + 1}", "document": doc["document"], "section": doc["section"],
+            sources.append({"document": doc["document"], "section": doc["section"],
                             "chunk_id": doc["chunk_id"], "document_id": doc["document_id"],
+                            "document_version": doc.get("document_version"), "chunk_hash": doc.get("chunk_hash"),
                             **({"source_url": doc["source_url"]} if doc.get("source_url") else {})})
         return sources
+
+    @staticmethod
+    def _remove_inline_source_tags(answer: str) -> str:
+        return re.sub(r"\s*\[S\d*\]?", "", answer, flags=re.IGNORECASE).strip()
+
+    def _stream_model_answer(self, model: str, prompt: str, progress_callback=None) -> str:
+        stream_generator = getattr(self.model_client, "generate_stream", None)
+        if not stream_generator:
+            return self._remove_inline_source_tags(self.model_client.generate(model, prompt))
+        answer_parts: list[str] = []
+        pending = [""]
+
+        def reset_for_fallback():
+            answer_parts.clear()
+            pending[0] = ""
+            if progress_callback:
+                progress_callback({"type": "reset_draft"})
+
+        try:
+            stream = stream_generator(model, prompt, on_fallback=reset_for_fallback)
+        except TypeError:  # Support simple model clients with the older two-argument stream method.
+            stream = stream_generator(model, prompt)
+        for piece in stream:
+            answer_parts.append(piece)
+            pending[0] += piece
+            partial_tag = re.search(r"\[(?:S\d*)?$", pending[0], flags=re.IGNORECASE)
+            safe_end = partial_tag.start() if partial_tag else len(pending[0])
+            visible = self._remove_inline_source_tags(pending[0][:safe_end])
+            pending[0] = pending[0][safe_end:]
+            if visible and progress_callback:
+                progress_callback({"type": "draft_token", "text": visible})
+        final_piece = self._remove_inline_source_tags(pending[0])
+        if final_piece and progress_callback:
+            progress_callback({"type": "draft_token", "text": final_piece})
+        return self._remove_inline_source_tags("".join(answer_parts))
+
+    @staticmethod
+    def _feedback_corpus_fingerprint(documents: list[dict[str, Any]]) -> str:
+        snapshot = sorted((doc["document_id"], doc.get("version"), doc.get("content_hash")) for doc in documents)
+        return hashlib.sha256(json.dumps(snapshot, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _cosine(left: list[float], right: list[float]) -> float:
+        if len(left) != len(right) or not left:
+            return 0.0
+        dot = sum(float(a) * float(b) for a, b in zip(left, right))
+        left_norm = sum(float(value) ** 2 for value in left) ** 0.5
+        right_norm = sum(float(value) ** 2 for value in right) ** 0.5
+        return dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
+
+    def _synthesize_upvoted_responses(self, question: str, groups: list[dict[str, Any]],
+                                      docs_by_id: dict[str, dict[str, Any]],
+                                      chunks_by_document: dict[tuple[str, str], dict[str, Any]],
+                                      session_id: str | None, *, stream_output: bool = False,
+                                      progress_callback=None) -> dict[str, Any]:
+        document_lookup = {doc["document_id"]: doc for doc in self.ingestion.metadata.list_documents()}
+        selected_chunks: dict[tuple[str, str], dict[str, Any]] = {}
+        for group in groups:
+            for source in group["entry"].get("sources", []):
+                key = (source["document_id"], source["chunk_id"])
+                chunk = chunks_by_document[key]
+                doc = docs_by_id[source["document_id"]]
+                document = document_lookup.get(source["document_id"], {})
+                selected_chunks.setdefault(key, {
+                    "document_id": source["document_id"], "document": document.get("filename", source["document_id"]),
+                    "source_url": document.get("source_url"), "document_version": document.get("version"),
+                    "section": chunk.get("section", {}).get("title", "Document"),
+                    "section_path": chunk.get("section", {}).get("path", []), "chunk_id": chunk["chunk_id"],
+                    "chunk_hash": chunk.get("content_hash"), "vector_id": chunk.get("vector_id"),
+                    "text": chunk["text"], "similarity": 1.0,
+                })
+        docs = list(selected_chunks.values())
+        sources = self._source_list(docs)
+        evidence = [{"document": doc["document"], "section": doc["section"],
+                     "chunk_id": doc["chunk_id"], "text": doc["text"]} for doc in docs]
+        prior_answers = [{"answer": group["answer"], "upvotes": group["count"],
+                          "sources": [{"document": src["document"], "section": src["section"], "chunk_id": src["chunk_id"]}
+                                      for src in group["entry"].get("sources", [])]}
+                         for group in groups]
+        feedback_context = (
+            "The following distinct responses were previously upvoted for this question. Synthesize their useful points, "
+            "but treat votes as preference signals rather than proof. Resolve conflicts using only the current evidence below. "
+            "Do not add source markers such as [S1]. Upvoted responses: "
+            + json.dumps(prior_answers, ensure_ascii=False)
+        )
+        if progress_callback:
+            progress_callback({"type": "stage", "stage": "feedback_synthesis",
+                               "detail": f"Synthesizing {len(groups)} upvoted responses from their current source chunks; skipping search."})
+        correction = "Use only the current evidence. Incorporate the useful information from the previously upvoted responses, resolve any differences against the evidence, and do not repeat unsupported claims."
+        answer = ""
+        evaluation_result: dict[str, Any] = {}
+        for attempt in range(2):
+            if attempt:
+                correction += " Revise the prior synthesis using evaluator feedback: " + str(evaluation_result.get("correction_feedback", ""))
+                if progress_callback:
+                    progress_callback({"type": "reset_draft"})
+                    progress_callback({"type": "stage", "stage": "answer_retry",
+                                       "detail": "Revising the synthesis against evaluator feedback."})
+            if progress_callback:
+                progress_callback({"type": "stage", "stage": "generation",
+                                   "detail": "Writing from the upvoted responses and their current documentation evidence."})
+            prompt = GENERATION_PROMPT.format(
+                correction=correction, feedback_context=feedback_context, question=question,
+                documents=json.dumps(evidence, ensure_ascii=False),
+            )
+            try:
+                if stream_output:
+                    answer = self._stream_model_answer(self.config.generation_model, prompt, progress_callback)
+                else:
+                    answer = self._remove_inline_source_tags(self.model_client.generate(self.config.generation_model, prompt))
+                if not answer:
+                    raise ModelError("Feedback synthesis returned an empty answer")
+            except ModelError as exc:
+                log.error("Upvoted-answer synthesis failed: %s", exc)
+                answer = UNVERIFIED
+                break
+
+            evaluation_result = self._answer_evaluation({
+                "original_query": question, "answer": answer, "relevant_documents": docs,
+                "generation_retry_count": attempt, "request_id": None, "correction_feedback": "",
+                "progress_callback": progress_callback,
+            })
+            evaluation = evaluation_result.get("evaluation_scores", {})
+            if evaluation.get("passed"):
+                confidence = {key: evaluation.get(key) for key in ("overall", "faithfulness", "relevance", "correctness", "status", "reasons", "unsupported_claims") if key in evaluation}
+                response = {"answer": answer, "confidence": confidence, "sources": sources,
+                            "session_id": session_id, "status": "passed", "retry_count": 0,
+                            "generation_retry_count": attempt, "fallback_used": False, "error": None,
+                            "feedback_shortcut": "upvoted_synthesis", "feedback_votes": sum(group["count"] for group in groups)}
+                if self.app_store:
+                    self.app_store.save_exchange(session_id, question, answer, response)
+                if progress_callback:
+                    progress_callback({"type": "stage", "stage": "approved",
+                                       "detail": "The synthesized answer passed verification against current cited chunks."})
+                log.info("feedback_shortcut_applied kind=upvoted_synthesis responses=%s votes=%s",
+                         len(groups), response["feedback_votes"])
+                return response
+            if evaluation_result.get("error") or not evaluation_result.get("should_regenerate"):
+                answer = UNVERIFIED
+                break
+
+        response = {"answer": UNVERIFIED, "confidence": {"overall": None, "faithfulness": None,
+                    "relevance": None, "correctness": None, "status": "unverified"},
+                    "sources": [], "session_id": session_id, "status": "unverified", "retry_count": 0,
+                    "generation_retry_count": 0, "fallback_used": False, "error": evaluation_result.get("error"),
+                    "feedback_shortcut": "upvoted_synthesis_unverified"}
+        if self.app_store:
+            self.app_store.save_exchange(session_id, question, response["answer"], response)
+        if progress_callback:
+            progress_callback({"type": "stage", "stage": "unverified",
+                               "detail": "The synthesized answer could not be verified. Showing a safe response."})
+        return response
+
+    def _feedback_shortcut(self, question: str, session_id: str | None,
+                           document_ids: list[str] | None, *, stream_output: bool = False,
+                           progress_callback=None) -> dict[str, Any] | None:
+        if progress_callback:
+            progress_callback({"type": "stage", "stage": "memory_check",
+                               "detail": "Checking prior questions and feedback for a semantic match…"})
+        if not self.app_store:
+            if progress_callback:
+                progress_callback({"type": "stage", "stage": "memory_none",
+                                   "detail": "No conversation memory is available; continuing to document search."})
+            return None
+        entries = self.app_store.feedback_entries()
+        try:
+            vector = self.ingestion.embedder.encode([question])
+        except Exception:
+            log.exception("Could not embed question for feedback-memory matching")
+            if progress_callback:
+                progress_callback({"type": "stage", "stage": "memory_unavailable",
+                                   "detail": "Could not compare feedback memory; continuing to document search."})
+            return None
+        if len(vector) != 1:
+            if progress_callback:
+                progress_callback({"type": "stage", "stage": "memory_unavailable",
+                                   "detail": "Could not compare feedback memory; continuing to document search."})
+            return None
+        query_embedding = vector[0]
+        selected = set(document_ids) if document_ids is not None else None
+        documents = self.ingestion.metadata.list_documents()
+        scoped_documents = [doc for doc in documents if selected is None or doc["document_id"] in selected]
+        corpus_fingerprint = self._feedback_corpus_fingerprint(scoped_documents)
+        scope = sorted(document_ids) if document_ids is not None else []
+        matches = []
+        for entry in entries:  # Store returns newest first, which is needed for consecutive downvotes.
+            if entry.get("scope", []) != scope:
+                continue
+            stored_embedding = entry.get("question_embedding")
+            if stored_embedding is None:
+                continue
+            similarity = self._cosine(query_embedding, stored_embedding)
+            if similarity >= self.config.feedback_similarity_threshold:
+                matches.append((entry, similarity))
+
+        # Show prior questions even when they have no thumbs feedback. Only feedback
+        # records above can affect answer reuse or downvote suppression.
+        history_matches = []
+        try:
+            recent_questions = self.app_store.recent_questions(limit=100) if hasattr(self.app_store, "recent_questions") else []
+            recent_questions = [text for text in recent_questions if text.strip()]
+            if recent_questions:
+                history_vectors = self.ingestion.embedder.encode(recent_questions)
+                if len(history_vectors) == len(recent_questions):
+                    history_matches = [
+                        {"question": text, "similarity": self._cosine(query_embedding, stored), "rating": None}
+                        for text, stored in zip(recent_questions, history_vectors)
+                    ]
+                    history_matches = [item for item in history_matches
+                                       if item["similarity"] >= self.config.feedback_similarity_threshold]
+        except Exception:
+            log.exception("Could not compare prior conversation questions for memory display")
+
+        visible_matches = {
+            " ".join(entry["question"].casefold().split()):
+                {"question": entry["question"], "similarity": similarity, "rating": entry.get("rating")}
+            for entry, similarity in matches
+        }
+        for item in history_matches:
+            key = " ".join(item["question"].casefold().split())
+            current = visible_matches.get(key)
+            if current is None or item["similarity"] > current["similarity"]:
+                visible_matches[key] = {**item, "rating": item.get("rating") or (current or {}).get("rating")}
+        nearest = sorted(visible_matches.values(), key=lambda item: item["similarity"], reverse=True)[:3]
+        if not matches:
+            if progress_callback:
+                if nearest:
+                    closest = nearest[0]
+                    progress_callback({"type": "stage", "stage": "memory_match",
+                                       "detail": (f"Found {len(visible_matches)} similar previous question(s). Closest: “{closest['question']}” "
+                                                  f"({closest['similarity']:.0%} similar); continuing to document search."),
+                                       "matches": [{**item, "similarity": round(item["similarity"], 3)} for item in nearest]})
+                else:
+                    progress_callback({"type": "stage", "stage": "memory_none",
+                                       "detail": "No similar previous questions found; continuing to document search."})
+            return None
+        if progress_callback:
+            closest = nearest[0]
+            progress_callback({"type": "stage", "stage": "memory_match",
+                               "detail": (f"Found {len(visible_matches)} similar previous question(s). Closest: “{closest['question']}” "
+                                          f"({closest['similarity']:.0%} similar); checking feedback and source freshness."),
+                               "matches": [{**item, "similarity": round(item["similarity"], 3)} for item in nearest]})
+
+        # A changed corpus invalidates old negative-feedback suppression.
+        consecutive_downvotes = 0
+        for entry, similarity in matches:
+            if similarity < self.config.feedback_direct_similarity_threshold:
+                continue
+            if entry.get("corpus_fingerprint") != corpus_fingerprint:
+                continue
+            if entry["rating"] == "down":
+                consecutive_downvotes += 1
+                if consecutive_downvotes == 3:
+                    response = {
+                        "answer": INSUFFICIENT,
+                        "confidence": {"overall": None, "faithfulness": None, "relevance": None,
+                                       "correctness": None, "status": "insufficient_evidence",
+                                       "reason": "Recent feedback repeatedly rated answers to this question as unhelpful."},
+                        "sources": [], "session_id": session_id, "status": "insufficient_evidence",
+                        "retry_count": 0, "generation_retry_count": 0, "fallback_used": False,
+                        "error": None, "feedback_shortcut": "downvote_suppression",
+                    }
+                    if self.app_store:
+                        self.app_store.save_exchange(session_id, question, response["answer"], response)
+                    log.info("feedback_shortcut_applied kind=downvote_suppression consecutive_votes=%s", consecutive_downvotes)
+                    return response
+            else:
+                consecutive_downvotes = 0
+
+        # Reuse an answer only if the exact cited document and chunk versions are still indexed.
+        chunks = self.ingestion.metadata.get_chunks()
+        chunks_by_document = {(chunk["document_id"], chunk["chunk_id"]): chunk for chunk in chunks}
+        docs_by_id = {doc["document_id"]: doc for doc in documents}
+        positive_groups: dict[tuple[str, str], dict[str, Any]] = {}
+        for entry, similarity in matches:
+            if entry.get("rating") != "up" or entry.get("response_status") != "passed" or not entry.get("answer"):
+                continue
+            sources = entry.get("sources") or []
+            if not sources:
+                continue
+            if not all(
+                source.get("document_id") in docs_by_id
+                and docs_by_id[source["document_id"]].get("version") == source.get("document_version")
+                and (source.get("document_id"), source.get("chunk_id")) in chunks_by_document
+                and chunks_by_document[(source["document_id"], source["chunk_id"])].get("content_hash") == source.get("chunk_hash")
+                for source in sources
+            ):
+                continue
+            canonical_sources = sorted(
+                ({key: value for key, value in source.items() if key != "label"} for source in sources),
+                key=lambda source: (source.get("document_id", ""), source.get("chunk_id", "")),
+            )
+            source_signature = json.dumps(canonical_sources, sort_keys=True, separators=(",", ":"))
+            clean_answer = self._remove_inline_source_tags(entry["answer"])
+            clean_hash = hashlib.sha256(clean_answer.encode("utf-8")).hexdigest()
+            key = (clean_hash, source_signature)
+            group = positive_groups.setdefault(key, {"count": 0, "direct_count": 0,
+                                                       "entry": entry, "answer": clean_answer})
+            group["count"] += 1
+            if similarity >= self.config.feedback_direct_similarity_threshold:
+                group["direct_count"] += 1
+        valid_groups = list(positive_groups.values())
+        upvote_count = sum(group["count"] for group in valid_groups)
+        if upvote_count < 3 or not valid_groups:
+            return None
+        if len(valid_groups) > 1 or valid_groups[0]["direct_count"] < 3:
+            return self._synthesize_upvoted_responses(question, valid_groups, docs_by_id,
+                chunks_by_document, session_id, stream_output=stream_output, progress_callback=progress_callback)
+        best = valid_groups[0]
+        if best["direct_count"] < 3:
+            return None
+        entry = best["entry"]
+        confidence = entry.get("confidence") or {}
+        confidence = {**confidence, "status": "passed"}
+        sources = [{key: value for key, value in source.items() if key != "label"} for source in entry["sources"]]
+        response = {"answer": best["answer"], "confidence": confidence, "sources": sources,
+                    "session_id": session_id, "status": "passed", "retry_count": 0,
+                    "generation_retry_count": 0, "fallback_used": False, "error": None,
+                    "feedback_shortcut": "upvoted_answer", "feedback_votes": best["count"]}
+        if self.app_store:
+            self.app_store.save_exchange(session_id, question, response["answer"], response)
+        log.info("feedback_shortcut_applied kind=upvoted_answer votes=%s", best["count"])
+        return response
 
     def _generation(self, state: RAGState) -> dict[str, Any]:
         started = perf_counter()
@@ -218,29 +545,25 @@ class RAGService:
         self._progress(state, "generation", "Writing a draft grounded in the relevant sources…")
         log.info("graph_node_started request_id=%s node=generation relevant=%s regeneration=%s", state.get("request_id"), len(docs), state.get("generation_retry_count", 0))
         sources = self._source_list(docs)
-        labels = {source["chunk_id"]: source["label"] for source in sources}
-        excerpt = [{"source_label": labels[d["chunk_id"]], "document": d["document"], "section": d["section"],
+        excerpt = [{"document": d["document"], "section": d["section"],
                     "chunk_id": d["chunk_id"], "text": d["text"]} for d in docs]
         correction = ""
         if state.get("generation_retry_count", 0):
             correction = "Correct the prior draft according to this evaluator feedback. Do not preserve unsupported claims: " + state.get("correction_feedback", "")
+            callback = state.get("progress_callback")
+            if callback:
+                callback({"type": "reset_draft"})
         try:
             prompt = GENERATION_PROMPT.format(
-                correction=correction, question=state["standalone_query"], documents=json.dumps(excerpt, ensure_ascii=False),
+                correction=correction, feedback_context="", question=state["standalone_query"],
+                documents=json.dumps(excerpt, ensure_ascii=False),
             )
-            answer_parts: list[str] = []
-            stream_generator = getattr(self.model_client, "generate_stream", None) if state.get("stream_output") else None
-            if stream_generator:
-                answer_parts.extend(stream_generator(self.config.generation_model, prompt))
+            if state.get("stream_output"):
+                answer = self._stream_model_answer(self.config.generation_model, prompt, state.get("progress_callback"))
             else:
-                answer_parts.append(self.model_client.generate(self.config.generation_model, prompt))
-            answer = "".join(answer_parts).strip()
+                answer = self._remove_inline_source_tags(self.model_client.generate(self.config.generation_model, prompt))
             if not answer:
                 raise ModelError("Generation response was empty")
-            # Remove labels the model could not have received. Returned sources remain exact metadata records.
-            allowed = {source["label"] for source in sources}
-            import re
-            answer = re.sub(r"\[(S\d+)\]", lambda m: m.group(0) if m.group(1) in allowed else "", answer)
             log.info("graph_node_completed request_id=%s node=generation sources=%s regeneration=%s duration_ms=%.1f",
                      state.get("request_id"), len(sources), state.get("generation_retry_count", 0), (perf_counter() - started) * 1000)
             return {"answer": answer, "sources": sources, "error": None}
@@ -320,7 +643,7 @@ class RAGService:
     def _final_response(state: RAGState) -> dict[str, Any]:
         callback = state.get("progress_callback")
         if callback:
-            callback({"type": "stage", "stage": "approved", "detail": "Answer passed verification. Streaming the approved answer…"})
+            callback({"type": "stage", "stage": "approved", "detail": "The streamed draft passed verification."})
         return {"response_status": "passed"}
 
     def _initial_state(self, question: str, session_id: str | None, *, document_ids: list[str] | None = None,
@@ -338,8 +661,6 @@ class RAGService:
         }
 
     def _format_response(self, result: dict[str, Any], session_id: str | None) -> dict[str, Any]:
-        if self.app_store:
-            self.app_store.save_exchange(session_id, result.get("original_query", ""), result.get("answer", ""))
         evaluation = result.get("evaluation_scores", {})
         confidence = {
             "overall": result.get("confidence_score"),
@@ -349,14 +670,20 @@ class RAGService:
         for key in ("reasons", "unsupported_claims", "reason"):
             if key in evaluation:
                 confidence[key] = evaluation[key]
-        return {"answer": result.get("answer", ""), "confidence": confidence, "sources": result.get("sources", []),
-                "session_id": session_id, "status": result.get("response_status", "unverified"),
-                "retry_count": result.get("retry_count", 0), "generation_retry_count": result.get("generation_retry_count", 0),
-                "fallback_used": result.get("fallback_used", False), "error": result.get("error")}
+        response = {"answer": result.get("answer", ""), "confidence": confidence, "sources": result.get("sources", []),
+                    "session_id": session_id, "status": result.get("response_status", "unverified"),
+                    "retry_count": result.get("retry_count", 0), "generation_retry_count": result.get("generation_retry_count", 0),
+                    "fallback_used": result.get("fallback_used", False), "error": result.get("error")}
+        if self.app_store:
+            self.app_store.save_exchange(session_id, result.get("original_query", ""), response["answer"], response)
+        return response
 
     def query(self, question: str, session_id: str | None = None, *, document_ids: list[str] | None = None,
               top_k: int | None = None, chat_history: list[dict[str, str]] | None = None,
               request_id: str | None = None) -> dict[str, Any]:
+        shortcut = self._feedback_shortcut(question, session_id, document_ids)
+        if shortcut:
+            return shortcut
         state = self._initial_state(question, session_id, document_ids=document_ids, top_k=top_k,
                                    chat_history=chat_history, request_id=request_id)
         result = self.graph.invoke(state)
@@ -374,16 +701,24 @@ class RAGService:
 
         def run_graph():
             try:
+                shortcut = self._feedback_shortcut(question, session_id, document_ids,
+                                                   stream_output=True, progress_callback=publish)
+                if shortcut:
+                    if not shortcut.get("feedback_shortcut", "").startswith("upvoted_synthesis"):
+                        publish({"type": "stage", "stage": "feedback_shortcut",
+                                 "detail": ("Using a version-checked upvoted answer; retrieval was skipped."
+                                            if shortcut["status"] == "passed" else
+                                            "Recent matching answers received consecutive downvotes; retrieval was skipped." )})
+                    if shortcut.get("feedback_shortcut") == "upvoted_answer":
+                        for index in range(0, len(shortcut["answer"]), 32):
+                            publish({"type": "token", "text": shortcut["answer"][index:index + 32]})
+                    publish({"type": "result", "response": shortcut})
+                    return
                 state = self._initial_state(question, session_id, document_ids=document_ids, top_k=top_k,
                                             chat_history=chat_history, request_id=request_id,
                                             stream_output=True, progress_callback=publish)
                 result = self.graph.invoke(state)
                 response = self._format_response(result, session_id)
-                if response["status"] == "passed":
-                    answer = response["answer"]
-                    # Flush readable pieces only after the evaluator has approved the complete draft.
-                    for index in range(0, len(answer), 32):
-                        publish({"type": "token", "text": answer[index:index + 32]})
                 publish({"type": "result", "response": response})
             except Exception:
                 log.exception("Streaming query failed request_id=%s", request_id)

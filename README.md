@@ -15,7 +15,7 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Open `.env` and set `GEMINI_API_KEY`. The API key stays on the backend. The default models are `gemini-3.1-flash-lite` for query rewriting and answer generation and `gemini-3.6-flash` for document grading and answer evaluation. On transient provider overloads or server errors, generation and judging each fall back through their respective `*_FALLBACK_MODELS` lists (defaults: `gemini-3.5-flash-lite`, then `gemini-3.1-flash-lite`). Fallbacks are not used for invalid credentials or model names. You can configure primary and fallback models independently. MongoDB metadata is selected with `MONGODB_URI`; without it, SQLite is used.
+Open `.env` and set `GEMINI_API_KEY`. The key stays on the backend. The default models are `gemini-3.1-flash-lite` for query rewriting and answer generation and `gemini-3.5-flash-lite` for document grading and answer evaluation. Both are lightweight models. On transient provider overloads, rate limits, or server errors, each call tries its role's configured `*_FALLBACK_MODELS` list; the default fallbacks use the other Flash-Lite model. Fallbacks cannot overcome a project-wide quota, invalid key, or provider outage affecting every model. MongoDB metadata is selected with `MONGODB_URI`; without it, SQLite is used.
 
 Install the frontend once:
 
@@ -81,12 +81,15 @@ Logs are emitted to the backend terminal with timestamp, severity, module, and e
 
 - `GET /health`
 - `POST /query` with `{ "question": "...", "session_id": "..." }`
-- `POST /query/stream` with the same JSON body for server-sent progress and answer events. It reports pipeline stages (including retrieval retries and verification) and streams answer text only after the evaluator approves it.
+- `POST /query` with `"stream": true` (or `Accept: text/event-stream`) for server-sent progress and draft text on the same route. Draft text streams as it is generated and is marked pending verification; the final response replaces it if evaluation rejects it.
+- `DELETE /sessions/{session_id}` to remove a conversation and its stored feedback.
 - `POST /ingest` with multipart field `file` or `url`
 - `GET /documents`
 - `POST /feedback` with a question, `rating` (`up` or `down`), optional `session_id`, and optional comment
 
 Successful query responses contain `answer`, nested `confidence` values (`overall`, `faithfulness`, `relevance`, `correctness`, `status`, reasons), and `sources` with actual document, section, and chunk IDs. The overall score is a grounded confidence indicator, not a calibrated probability. Unverified answers do not receive a successful confidence score.
+
+Feedback can shortcut future semantically matching questions. If one answer has at least three upvotes, it can be reused while its cited document versions and chunk hashes remain unchanged. If three or more upvotes are split across different answers, the lightweight generation model synthesizes those responses against their current cited chunks, then the judge verifies the synthesis; retrieval is skipped. Three consecutive downvotes return an insufficient-evidence response while the indexed corpus snapshot is unchanged. Semantic matching uses the local embedding model and `FEEDBACK_SIMILARITY_THRESHOLD` (default `0.92`). Answers keep source details in the source list and omit inline `[S1]` markers.
 
 Example request:
 
@@ -100,7 +103,7 @@ Successful response shape (values and IDs below are illustrative):
 
 ```json
 {
-  "answer": "Declare a dependency with Depends() in the path operation. [S1]",
+  "answer": "Declare a dependency with Depends() in the path operation.",
   "confidence": {
     "overall": 92,
     "faithfulness": 95,

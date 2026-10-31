@@ -4,7 +4,7 @@ import Sidebar from './components/Sidebar.jsx'
 import ChatMessage from './components/ChatMessage.jsx'
 import DocumentsPage from './pages/DocumentsPage.jsx'
 import SettingsPage from './pages/SettingsPage.jsx'
-import { checkHealth, friendlyError, streamQuestion } from './services/api.js'
+import { checkHealth, deleteConversation, friendlyError, streamQuestion } from './services/api.js'
 
 const SUGGESTIONS = [
   { icon: FileText, title: 'Explain a concept', text: 'What are the key concepts in my documentation?' },
@@ -95,6 +95,27 @@ export default function App() {
     setSidebarOpen(false)
   }
 
+  async function deleteChat(id) {
+    const chat = chats.find((item) => item.id === id)
+    if (!chat) return
+    if (busy && activeChatId === id) {
+      setError('Wait for the current answer to finish before deleting this conversation.')
+      return
+    }
+    if (!window.confirm(`Delete “${chat.title || 'this conversation'}” and its stored history?`)) return
+    try {
+      await deleteConversation(id)
+      setChats((current) => current.filter((item) => item.id !== id))
+      if (activeChatId === id) {
+        setActiveChatId(null)
+        setPage('chat')
+      }
+      setError('')
+    } catch (deleteError) {
+      setError(friendlyError(deleteError))
+    }
+  }
+
   async function submitQuestion(explicitQuestion) {
     const question = (explicitQuestion ?? draft).trim()
     if (!question || busy) return
@@ -124,13 +145,13 @@ export default function App() {
           messages: current.messages.map((message) => message.id !== assistantId ? message : {
             ...message,
             progress: [...(message.progress || []).map((step) => ({ ...step, state: 'complete' })),
-              { stage: event.stage, label: event.label, detail: event.detail, state: 'active' }],
+              { stage: event.stage, label: event.label, detail: event.detail, matches: event.matches, state: 'active' }],
           }),
           updatedAt: Date.now(),
         })),
         onToken: (text) => updateChat(sessionId, (current) => ({
           ...current,
-          messages: current.messages.map((message) => message.id === assistantId ? { ...message, content: message.content + text } : message),
+          messages: current.messages.map((message) => message.id === assistantId ? { ...message, content: text === null ? '' : message.content + text } : message),
           updatedAt: Date.now(),
         })),
       })
@@ -139,7 +160,7 @@ export default function App() {
         messages: current.messages.map((message) => message.id !== assistantId ? message : {
           ...message, content: response.answer || 'The assistant returned an empty answer.', status: response.status,
           confidence: response.confidence, sources: response.sources || [],
-          progress: (message.progress || []).map((step) => ({ ...step, state: 'complete' })),
+          progress: [],
         }),
         updatedAt: Date.now(),
       }))
@@ -149,12 +170,12 @@ export default function App() {
       if (backend?.answer) {
         updateChat(sessionId, (current) => ({ ...current, messages: current.messages.map((message) => message.id === assistantId ? {
           ...message, content: backend.answer, status: backend.status || 'unverified', confidence: backend.confidence,
-          sources: backend.sources || [], progress: (message.progress || []).map((step) => ({ ...step, state: 'complete' })),
+          sources: backend.sources || [], progress: [],
         } : message), updatedAt: Date.now() }))
       } else {
         setError(friendlyError(requestError))
         updateChat(sessionId, (current) => ({ ...current, messages: current.messages.map((message) => message.id === assistantId ? {
-          ...message, content: friendlyError(requestError), status: 'error',
+          ...message, content: friendlyError(requestError), status: 'error', progress: [],
         } : message), updatedAt: Date.now() }))
       }
     } finally {
@@ -171,7 +192,7 @@ export default function App() {
 
   return <div className={`app-frame ${sidebarOpen ? 'mobile-sidebar-open' : ''}`}>
     <button className="mobile-scrim" aria-label="Close menu" onClick={() => setSidebarOpen(false)} />
-    <Sidebar page={page} setPage={(value) => { setPage(value); setSidebarOpen(false) }} chats={chats.filter((chat) => chat.messages.length)} activeChatId={activeChatId} onNewChat={startNewChat} onSelectChat={selectChat} />
+    <Sidebar page={page} setPage={(value) => { setPage(value); setSidebarOpen(false) }} chats={chats.filter((chat) => chat.messages.length)} activeChatId={activeChatId} onNewChat={startNewChat} onSelectChat={selectChat} onDeleteChat={deleteChat} />
     <main className="main-area">
       <header className="topbar">
         <div className="topbar-left"><button className="mobile-menu-button" aria-label="Open menu" onClick={() => setSidebarOpen(true)}><ChevronDown size={17} /></button><span className="breadcrumb-muted">Workspace</span><span className="breadcrumb-separator">/</span><strong>{pageLabel}</strong></div>

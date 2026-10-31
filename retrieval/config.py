@@ -7,9 +7,9 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class RetrievalConfig:
     generation_model: str = "gemini-3.1-flash-lite"
-    judge_model: str = "gemini-3.6-flash"
-    generation_fallback_models: tuple[str, ...] = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-    judge_fallback_models: tuple[str, ...] = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+    judge_model: str = "gemini-3.5-flash-lite"
+    generation_fallback_models: tuple[str, ...] = ("gemini-3.5-flash-lite",)
+    judge_fallback_models: tuple[str, ...] = ("gemini-3.1-flash-lite",)
     gemini_api_key: str | None = None
     gemini_timeout_ms: int = 30000
     top_k: int = 5
@@ -17,6 +17,8 @@ class RetrievalConfig:
     minimum_dimension_score: int = 70
     minimum_overall_score: int = 75
     max_history_turns: int = 8
+    feedback_similarity_threshold: float = 0.80
+    feedback_direct_similarity_threshold: float = 0.93
 
     @classmethod
     def from_env(cls) -> "RetrievalConfig":
@@ -37,6 +39,8 @@ class RetrievalConfig:
             minimum_dimension_score=int(os.getenv("MINIMUM_DIMENSION_SCORE", "70")),
             minimum_overall_score=int(os.getenv("MINIMUM_OVERALL_SCORE", "75")),
             max_history_turns=int(os.getenv("MAX_HISTORY_TURNS", "8")),
+            feedback_similarity_threshold=float(os.getenv("FEEDBACK_SIMILARITY_THRESHOLD", "0.80")),
+            feedback_direct_similarity_threshold=float(os.getenv("FEEDBACK_DIRECT_SIMILARITY_THRESHOLD", "0.93")),
         )
 
     def validate(self) -> None:
@@ -48,3 +52,7 @@ class RetrievalConfig:
             raise ValueError("MAX_RETRIEVAL_RETRIES must be between 0 and 2")
         if not 0 <= self.minimum_dimension_score <= 100 or not 0 <= self.minimum_overall_score <= 100:
             raise ValueError("Evaluation thresholds must be between 0 and 100")
+        if not 0.0 <= self.feedback_similarity_threshold <= 1.0:
+            raise ValueError("FEEDBACK_SIMILARITY_THRESHOLD must be between 0 and 1")
+        if not self.feedback_similarity_threshold <= self.feedback_direct_similarity_threshold <= 1.0:
+            raise ValueError("FEEDBACK_DIRECT_SIMILARITY_THRESHOLD must be at least FEEDBACK_SIMILARITY_THRESHOLD and at most 1")
