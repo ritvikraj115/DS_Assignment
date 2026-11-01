@@ -38,6 +38,9 @@ const STREAM_STAGE_LABELS = {
   memory_check: 'Checking previous questions',
   memory_match: 'Similar previous questions found',
   memory_none: 'No similar previous questions found',
+  feedback_review: 'Checking whether past feedback applies',
+  feedback_rejected: 'Past answers did not pass; continuing to retrieval',
+  feedback_approved: 'Feedback answer passed verification',
   memory_unavailable: 'Previous-question matching unavailable',
   feedback_shortcut: 'Using a version-checked past answer',
   query_analysis: 'Understanding the question',
@@ -112,6 +115,16 @@ export async function streamQuestion({ question, sessionId, onStage, onToken }) 
 export async function fetchDocuments() {
   const { data } = await api.get('/documents')
   return data.documents || []
+}
+
+export async function deleteDocument(documentId) {
+  const { data } = await api.delete(`/documents/${encodeURIComponent(documentId)}`)
+  return data
+}
+
+export async function clearDocuments() {
+  const { data } = await api.delete('/documents')
+  return data
 }
 
 export async function ingestFile(file, onUploadProgress) {

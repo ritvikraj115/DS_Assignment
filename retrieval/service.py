@@ -16,8 +16,10 @@ from ingestion.service import IngestionService
 from .config import RetrievalConfig
 from .llm import GeminiClient, ModelClient, ModelError
 from .models import RAGState
-from .prompts import EVALUATION_PROMPT, GENERATION_PROMPT, GRADE_PROMPT, QUERY_REWRITE_PROMPT
-from .schemas import (AnswerEvaluationOutput, DocumentGradingOutput, QueryRewriteOutput,
+from .prompts import (EVALUATION_PROMPT, FEEDBACK_ANSWER_PROMPT, GENERATION_PROMPT,
+                      GRADE_PROMPT, QUERY_REWRITE_PROMPT)
+from .schemas import (AnswerEvaluationOutput, DocumentGradingOutput, FeedbackAnswerOutput,
+                      QueryRewriteOutput, StrictOutput,
                       parse_structured_output)
 
 log = logging.getLogger(__name__)
@@ -63,6 +65,22 @@ class RAGService:
         if callback:
             callback({"type": "stage", "stage": stage, "detail": detail})
 
+    def _generate_structured(self, model: str, fallbacks: tuple[str, ...], prompt: str,
+                             schema: type[StrictOutput], validate=None):
+        """Try configured role fallbacks when a model returns JSON that fails its schema."""
+        candidates = list(dict.fromkeys(candidate for candidate in (model, *fallbacks) if candidate))
+        last_error = None
+        for candidate in candidates:
+            raw = self.model_client.generate(candidate, prompt, json_mode=True)
+            try:
+                data = parse_structured_output(raw, schema)
+                return validate(data) if validate else data
+            except ModelError as exc:
+                last_error = exc
+                log.warning("structured_output_rejected model=%s schema=%s reason=%s",
+                            candidate, schema.__name__, exc)
+        raise last_error or ModelError(f"No model configured for {schema.__name__}")
+
     def _build_graph(self):
         graph = StateGraph(RAGState)
         graph.add_node("query_analysis", self._query_analysis)
@@ -107,15 +125,21 @@ class RAGService:
                     "rewritten_query": state.get("rewritten_query") or original,
                     "search_scope_empty": True, "error": None}
         try:
-            raw = self.model_client.generate(self.config.generation_model, QUERY_REWRITE_PROMPT.format(
+            prompt = QUERY_REWRITE_PROMPT.format(
                 original_query=original, standalone_query=state.get("standalone_query", original),
                 retry_count=state.get("retry_count", 0), chat_history=json.dumps(state.get("chat_history", []), ensure_ascii=False),
-            ), json_mode=True)
-            data = parse_structured_output(raw, QueryRewriteOutput)
+            )
+
+            def validate_rewrite(data):
+                if not data.standalone_query.strip() or not data.rewritten_query.strip():
+                    raise ModelError("Query rewrite response contains empty questions")
+                return data
+
+            data = self._generate_structured(self.config.generation_model,
+                                             self.config.generation_fallback_models,
+                                             prompt, QueryRewriteOutput, validate_rewrite)
             standalone = data.standalone_query.strip()
             rewritten = data.rewritten_query.strip()
-            if not standalone or not rewritten:
-                raise ModelError("Query rewrite response contains empty questions")
             log.info("graph_node_completed request_id=%s node=query_analysis retry_count=%s duration_ms=%.1f",
                      state.get("request_id"), state.get("retry_count", 0), (perf_counter() - started) * 1000)
             return {"standalone_query": standalone, "rewritten_query": rewritten, "error": None}
@@ -200,19 +224,22 @@ class RAGService:
                     "fallback_used": state.get("fallback_used", False) or retry}
         compact = [{k: d[k] for k in ("chunk_id", "document", "section", "text")} for d in docs]
         try:
-            raw = self.model_client.generate(self.config.judge_model, GRADE_PROMPT.format(
+            prompt = GRADE_PROMPT.format(
                 question=state["standalone_query"], documents=json.dumps(compact, ensure_ascii=False),
-            ), json_mode=True)
-            data = parse_structured_output(raw, DocumentGradingOutput)
-            by_id = {grade.chunk_id: grade for grade in data.grades}
-            if set(by_id) != {doc["chunk_id"] for doc in docs}:
-                raise ModelError("Document grading response does not match retrieved chunks")
-            graded = []
-            for doc in docs:
-                grade = by_id.get(doc["chunk_id"])
-                if grade is None:
-                    raise ModelError("Document grading response omitted a retrieved chunk")
-                graded.append({**doc, "relevant": grade.relevant, "reason": grade.reason})
+            )
+
+            def attach_grades(data):
+                by_id = {grade.chunk_id: grade for grade in data.grades}
+                expected_ids = {doc["chunk_id"] for doc in docs}
+                if set(by_id) != expected_ids:
+                    raise ModelError("Document grading response does not match retrieved chunks")
+                return [{**doc, "relevant": by_id[doc["chunk_id"]].relevant,
+                         "reason": by_id[doc["chunk_id"]].reason} for doc in docs]
+
+            graded = self._generate_structured(
+                self.config.judge_model, self.config.judge_fallback_models, prompt,
+                DocumentGradingOutput, attach_grades,
+            )
             relevant = [doc for doc in graded if doc["relevant"]]
             retry = not relevant and state.get("retry_count", 0) < self.config.max_retrieval_retries
             log.info("graph_node_completed request_id=%s node=document_grading relevant=%s retry=%s duration_ms=%.1f",
@@ -316,19 +343,27 @@ class RAGService:
 
     def canonical_feedback_question(self, question: str, rating: str, document_ids: list[str] | None,
                                     embedding: list[float]) -> str:
-        if not self.app_store:
+        return self.find_canonical_feedback_question(
+            self.app_store, self.config, question, rating, document_ids, embedding)
+
+    @staticmethod
+    def find_canonical_feedback_question(app_store, config: RetrievalConfig, question: str,
+                                         rating: str, document_ids: list[str] | None,
+                                         embedding: list[float]) -> str:
+        if not app_store:
             return question
         scope = sorted(document_ids) if document_ids is not None else []
-        threshold = (self.config.feedback_positive_similarity_threshold if rating == "up"
-                     else self.config.feedback_negative_similarity_threshold)
+        # Canonical question identity is rating-independent. Shortcut decisions
+        # still use their stricter positive/negative thresholds at query time.
+        threshold = config.feedback_positive_similarity_threshold
         candidates = []
-        for entry in self.app_store.feedback_entries():
+        for entry in app_store.feedback_entries():
             if entry.get("scope", []) != scope:
                 continue
             stored = entry.get("question_embedding")
             if stored is None:
                 continue
-            similarity = self._cosine(embedding, stored)
+            similarity = RAGService._cosine(embedding, stored)
             if similarity >= threshold:
                 candidates.append((similarity, entry["question"]))
         return max(candidates, default=(0.0, question), key=lambda item: item[0])[1]
@@ -362,14 +397,19 @@ class RAGService:
         corpus_fingerprint = self._feedback_corpus_fingerprint(scoped_documents)
         scope = sorted(document_ids) if document_ids is not None else []
         matches = []
+        shortcut_matches = []
         for entry in entries:
             if entry.get("scope", []) != scope or entry.get("question_embedding") is None:
                 continue
             similarity = self._cosine(query_embedding, entry["question_embedding"])
             threshold = (self.config.feedback_positive_similarity_threshold if entry.get("rating") == "up"
                          else self.config.feedback_negative_similarity_threshold)
-            if similarity >= threshold:
+            # Question display/deduplication uses the canonical threshold even
+            # when this rating is not yet eligible for a shortcut.
+            if similarity >= self.config.feedback_positive_similarity_threshold:
                 matches.append((entry, similarity))
+            if similarity >= threshold:
+                shortcut_matches.append((entry, similarity))
 
         history_matches = []
         try:
@@ -385,13 +425,44 @@ class RAGService:
                             store_embedding = getattr(self.app_store, "store_question_embedding", None)
                             if store_embedding:
                                 store_embedding(record["id"], embedding)
-                history_matches = [
-                    {"question": record["question"],
-                     "similarity": self._cosine(query_embedding, record["question_embedding"]), "rating": None}
-                    for record in records if record.get("question_embedding")
-                ]
+                history_matches = []
+                for record in records:
+                    record_embedding = record.get("question_embedding")
+                    if not record_embedding:
+                        continue
+                    resolved = " ".join((record.get("feedback_question") or "").casefold().split())
+                    related = [entry for entry in entries
+                               if entry.get("scope", []) == scope and entry.get("question_embedding")
+                               and (" ".join(entry["question"].casefold().split()) == resolved
+                                    or self._cosine(record_embedding, entry["question_embedding"])
+                                    >= self.config.feedback_positive_similarity_threshold)]
+                    ups = sum(entry.get("rating") == "up" for entry in related)
+                    downs = sum(entry.get("rating") == "down" for entry in related)
+                    history_matches.append({
+                        "question": record["question"],
+                        "similarity": self._cosine(query_embedding, record_embedding),
+                        "rating": ("mixed" if ups and downs else "up" if ups else "down" if downs else None),
+                        "feedback_score": ups - downs,
+                        "response_count": len({entry.get("answer_hash") for entry in related if entry.get("answer_hash")}),
+                        "_feedback_ids": [entry["feedback_id"] for entry in related],
+                        "_embedding": record_embedding,
+                    })
                 history_matches = [item for item in history_matches
                                    if item["similarity"] >= self.config.feedback_positive_similarity_threshold]
+                for item in history_matches:
+                    related_ids = set(item.get("_feedback_ids", []))
+                    for entry in entries:
+                        if entry.get("feedback_id") not in related_ids:
+                            continue
+                        pair = (entry, item["similarity"])
+                        if all(existing[0].get("feedback_id") != entry["feedback_id"] for existing in matches):
+                            matches.append(pair)
+                        threshold = (self.config.feedback_positive_similarity_threshold if entry.get("rating") == "up"
+                                     else self.config.feedback_negative_similarity_threshold)
+                        if (entry.get("rating") == "up" and item["similarity"] >= threshold and all(
+                                existing[0].get("feedback_id") != entry["feedback_id"]
+                                for existing in shortcut_matches)):
+                            shortcut_matches.append(pair)
         except Exception:
             log.exception("Could not compare prior conversation questions for memory display")
 
@@ -400,33 +471,59 @@ class RAGService:
         visible = {}
         for entry, similarity in matches:
             key = " ".join(entry["question"].casefold().split())
-            visible[key] = {"question": entry["question"], "similarity": similarity, "rating": entry.get("rating")}
+            item = visible.setdefault(key, {"question": entry["question"], "similarity": similarity,
+                                             "upvotes": 0, "downvotes": 0, "answers": set(),
+                                             "_embedding": entry.get("question_embedding")})
+            item["similarity"] = max(item["similarity"], similarity)
+            item["upvotes"] += int(entry.get("rating") == "up")
+            item["downvotes"] += int(entry.get("rating") == "down")
+            if entry.get("answer_hash"):
+                item["answers"].add(entry["answer_hash"])
+        for key, item in visible.items():
+            item["rating"] = ("mixed" if item["upvotes"] and item["downvotes"] else
+                               "up" if item["upvotes"] else "down" if item["downvotes"] else None)
+            item["feedback_score"] = item["upvotes"] - item["downvotes"]
+            item["response_count"] = len(item["answers"])
+            del item["answers"]
         for item in history_matches:
             key = " ".join(item["question"].casefold().split())
             previous = visible.get(key)
+            feedback_group = max(
+                (candidate for candidate in visible.values()
+                 if candidate.get("rating") and self._cosine(item.get("_embedding") or [],
+                                                               candidate.get("_embedding") or [])
+                 >= self.config.feedback_positive_similarity_threshold),
+                key=lambda candidate: candidate["similarity"], default=None,
+            )
             if previous is None or item["similarity"] > previous["similarity"]:
-                visible[key] = {**item, "rating": item.get("rating") or (previous or {}).get("rating")}
+                visible[key] = {**item, "rating": (previous or {}).get("rating") or item.get("rating") or
+                                (feedback_group or {}).get("rating"),
+                                "feedback_score": (previous or {}).get("feedback_score",
+                                                   item.get("feedback_score", (feedback_group or {}).get("feedback_score"))),
+                                "response_count": (previous or {}).get("response_count",
+                                                      item.get("response_count", (feedback_group or {}).get("response_count", 0)))}
         nearest = sorted(visible.values(), key=lambda item: item["similarity"], reverse=True)[:3]
         if progress_callback:
             if nearest:
                 closest = nearest[0]
                 detail = (f"Found {len(visible)} similar previous question(s). Closest: {closest['question']} "
                           f"({closest['similarity']:.0%} similar); "
-                          f"{'checking feedback and source freshness.' if matches else 'continuing to document search.'}")
+                          f"{'reviewing grouped feedback and source freshness.' if matches else 'continuing to document search.'}")
                 progress_callback({"type": "stage", "stage": "memory_match", "detail": detail,
-                                   "matches": [{**item, "similarity": round(item["similarity"], 3)} for item in nearest]})
+                                   "matches": [{key: value for key, value in item.items() if not key.startswith("_")}
+                                               | {"similarity": round(item["similarity"], 3)} for item in nearest]})
             elif not matches:
                 progress_callback({"type": "stage", "stage": "memory_none",
                                    "detail": "No similar previous questions found; continuing to document search."})
-        if not matches:
+        if not shortcut_matches:
             return None
 
+        shortcut_feedback_ids = {entry["feedback_id"] for entry, _ in shortcut_matches}
         question_groups: list[dict[str, Any]] = []
         for entry, _ in sorted(matches, key=lambda item: item[1], reverse=True):
             normalized = " ".join(entry["question"].casefold().split())
             entry_embedding = entry.get("question_embedding") or []
-            threshold = (self.config.feedback_positive_similarity_threshold if entry.get("rating") == "up"
-                         else self.config.feedback_negative_similarity_threshold)
+            threshold = self.config.feedback_positive_similarity_threshold
             question_group = next((group for group in question_groups
                                    if group["scope"] == entry.get("scope", [])
                                    and (group["normalized"] == normalized
@@ -434,9 +531,11 @@ class RAGService:
             if question_group is None:
                 question_group = {"question": entry["question"], "normalized": normalized,
                                   "question_embedding": entry_embedding, "scope": entry.get("scope", []),
-                                  "entries": [], "responses": {}}
+                                  "entries": [], "shortcut_entries": [], "responses": {}}
                 question_groups.append(question_group)
             question_group["entries"].append(entry)
+            if any(candidate["feedback_id"] == entry["feedback_id"] for candidate, _ in shortcut_matches):
+                question_group["shortcut_entries"].append(entry)
             source_signature = json.dumps(sorted(entry.get("sources") or [],
                                                   key=lambda source: (source.get("document_id", ""), source.get("chunk_id", ""))),
                                           sort_keys=True, separators=(",", ":"))
@@ -451,17 +550,21 @@ class RAGService:
         chunks = self.ingestion.metadata.get_chunks()
         chunks_by_document = {(chunk["document_id"], chunk["chunk_id"]): chunk for chunk in chunks}
         docs_by_id = {doc["document_id"]: doc for doc in documents}
-        answer_candidates = []
         for group in question_groups:
             current_entries = [entry for entry in group["entries"]
-                               if entry.get("corpus_fingerprint") == corpus_fingerprint]
+                               if entry.get("corpus_fingerprint") == corpus_fingerprint
+                               and entry["feedback_id"] in shortcut_feedback_ids]
+            eligible_entries = [entry for entry in group["shortcut_entries"]
+                                if entry.get("corpus_fingerprint") == corpus_fingerprint]
+            if not eligible_entries:
+                continue
             feedback_score = sum(1 if entry.get("rating") == "up" else -1 for entry in current_entries)
             confidence_values = [entry["confidence"]["overall"] for entry in current_entries
-                                 if entry.get("rating") == "down"
-                                 if isinstance(entry.get("confidence"), dict)
+                                 if entry.get("rating") == "down" and isinstance(entry.get("confidence"), dict)
                                  and isinstance(entry["confidence"].get("overall"), (int, float))]
             mean_confidence = (sum(confidence_values) / len(confidence_values)) if confidence_values else None
-            if (feedback_score < -1 and mean_confidence is not None
+            if (any(entry.get("rating") == "down" for entry in eligible_entries)
+                    and feedback_score < -1 and mean_confidence is not None
                     and mean_confidence < self.config.minimum_overall_score):
                 response = {
                     "answer": INSUFFICIENT,
@@ -481,48 +584,115 @@ class RAGService:
                          feedback_score, mean_confidence)
                 return response
 
-            for answer_group in group["responses"].values():
-                if answer_group["feedback_score"] < 1 or not answer_group["answer"]:
-                    continue
-                for entry in answer_group["entries"]:
-                    confidence = entry.get("confidence") or {}
-                    score = confidence.get("overall")
-                    if (entry.get("rating") != "up" or entry.get("response_status") != "passed"
-                            or not isinstance(score, (int, float))
-                            or score < self.config.minimum_overall_score):
-                        continue
-                    sources = entry.get("sources") or []
-                    if not sources or not all(
-                        source.get("document_id") in docs_by_id
-                        and docs_by_id[source["document_id"]].get("version") == source.get("document_version")
-                        and (source.get("document_id"), source.get("chunk_id")) in chunks_by_document
-                        and chunks_by_document[(source.get("document_id"), source.get("chunk_id"))].get("content_hash") == source.get("chunk_hash")
-                        for source in sources
-                    ):
-                        continue
-                    answer_candidates.append((score, answer_group["feedback_score"], group, entry))
+            if not any(entry.get("rating") == "up" for entry in eligible_entries):
+                continue
 
-        if not answer_candidates:
-            return None
-        _, feedback_score, group, entry = max(
-            answer_candidates, key=lambda item: (item[0], item[1], item[3].get("created_at", "")))
-        confidence = {**(entry.get("confidence") or {}), "status": "passed"}
-        sources = [{key: value for key, value in source.items() if key != "label"}
-                   for source in entry["sources"]]
-        response = {
-            "answer": self._remove_inline_source_tags(entry["answer"]), "confidence": confidence,
-            "sources": sources, "session_id": session_id, "status": "passed", "retry_count": 0,
-            "generation_retry_count": 0, "fallback_used": False, "error": None,
-            "feedback_shortcut": "upvoted_answer", "feedback_score": feedback_score,
-            "feedback_question": group["question"],
-            "feedback_responses": [{"answer": item["answer"], "sources": item["sources"],
-                                    "feedback_score": item["feedback_score"]}
-                                   for item in group["responses"].values()],
-        }
-        self._save_exchange(session_id, question, response["answer"], response, query_embedding)
-        log.info("feedback_shortcut_applied kind=upvoted_answer feedback_score=%s confidence=%s",
-                 feedback_score, confidence.get("overall"))
-        return response
+            response_context = []
+            current_docs: dict[tuple[str, str], dict[str, Any]] = {}
+            for answer_group in group["responses"].values():
+                eligible_response_entries = [entry for entry in answer_group["entries"]
+                                             if entry["feedback_id"] in shortcut_feedback_ids
+                                             and entry.get("corpus_fingerprint") == corpus_fingerprint]
+                answer_feedback_score = sum(1 if entry.get("rating") == "up" else -1
+                                            for entry in eligible_response_entries)
+                if answer_feedback_score < 1 or not answer_group["answer"]:
+                    continue
+                valid_entries = [entry for entry in eligible_response_entries
+                                 if entry.get("rating") == "up"
+                                 and entry.get("response_status") == "passed"
+                                 and isinstance((entry.get("confidence") or {}).get("overall"), (int, float))
+                                 and (entry.get("confidence") or {})["overall"] >= self.config.minimum_overall_score]
+                if not valid_entries:
+                    continue
+                entry = max(valid_entries, key=lambda item: item.get("created_at", ""))
+                cited_sources = entry.get("sources") or []
+                if not cited_sources or not all(
+                    source.get("document_id") in docs_by_id
+                    and docs_by_id[source["document_id"]].get("version") == source.get("document_version")
+                    and (source.get("document_id"), source.get("chunk_id")) in chunks_by_document
+                    and chunks_by_document[(source["document_id"], source["chunk_id"])].get("content_hash") == source.get("chunk_hash")
+                    for source in cited_sources
+                ):
+                    continue
+                response_context.append({"answer": answer_group["answer"],
+                                         "positive_feedback_score": answer_feedback_score})
+                for source in cited_sources:
+                    chunk = chunks_by_document[(source["document_id"], source["chunk_id"])]
+                    doc = docs_by_id[source["document_id"]]
+                    key = (source["document_id"], source["chunk_id"])
+                    current_docs[key] = {
+                        "document_id": source["document_id"], "document": doc["filename"],
+                        "source_url": doc.get("source_url"), "document_version": doc.get("version"),
+                        "section": source.get("section") or chunk.get("section", {}).get("title", "Document"),
+                        "section_path": chunk.get("section", {}).get("path", []),
+                        "chunk_id": source["chunk_id"], "chunk_hash": source.get("chunk_hash"),
+                        "vector_id": chunk.get("vector_id"), "text": chunk["text"], "similarity": 1.0,
+                    }
+
+            if not response_context or not current_docs:
+                continue
+            if progress_callback:
+                progress_callback({"type": "stage", "stage": "feedback_review",
+                                   "detail": f"Checking {len(response_context)} positively rated answer variant(s) against their current sources."})
+            try:
+                memory_prompt = FEEDBACK_ANSWER_PROMPT.format(
+                    question=question, canonical_question=group["question"],
+                    answers=json.dumps(response_context[:10], ensure_ascii=False),
+                    documents=json.dumps([{"document": doc["document"], "section": doc["section"],
+                                           "chunk_id": doc["chunk_id"], "text": doc["text"]}
+                                          for doc in list(current_docs.values())[:10]], ensure_ascii=False),
+                )
+                decision = self._generate_structured(self.config.generation_model,
+                                                     self.config.generation_fallback_models,
+                                                     memory_prompt, FeedbackAnswerOutput)
+            except ModelError as exc:
+                log.warning("Positive feedback answer could not be reviewed; continuing to retrieval: %s", exc)
+                decision = None
+            if not decision or not decision.can_answer or not decision.answer.strip():
+                if progress_callback:
+                    progress_callback({"type": "stage", "stage": "feedback_rejected",
+                                       "detail": "The positively rated answers do not safely resolve this wording; continuing to document retrieval."})
+                continue
+
+            cited_docs = list(current_docs.values())[:10]
+            evaluation_state = {
+                "original_query": question, "standalone_query": question, "answer": decision.answer.strip(),
+                "relevant_documents": cited_docs, "generation_retry_count": 1,
+                "progress_callback": progress_callback, "request_id": None,
+            }
+            evaluation = self._answer_evaluation(evaluation_state)
+            if evaluation.get("error") or not evaluation.get("evaluation_scores", {}).get("passed"):
+                if progress_callback:
+                    progress_callback({"type": "stage", "stage": "feedback_rejected",
+                                       "detail": "The answer from feedback memory did not pass source verification; continuing to document retrieval."})
+                continue
+
+            confidence_data = evaluation["evaluation_scores"]
+            confidence = {"overall": evaluation["confidence_score"],
+                          "faithfulness": confidence_data["faithfulness"],
+                          "relevance": confidence_data["relevance"],
+                          "correctness": confidence_data["correctness"],
+                          "status": "passed", "reasons": confidence_data["reasons"],
+                          "unsupported_claims": confidence_data["unsupported_claims"]}
+            response = {
+                "answer": self._remove_inline_source_tags(decision.answer.strip()),
+                "confidence": confidence, "sources": self._source_list(cited_docs),
+                "session_id": session_id, "status": "passed", "retry_count": 0,
+                "generation_retry_count": 0, "fallback_used": False, "error": None,
+                "feedback_shortcut": "upvoted_answer", "feedback_score": feedback_score,
+                "feedback_question": group["question"],
+                "feedback_responses": [{"answer": item["answer"], "sources": item["sources"],
+                                         "feedback_score": item["feedback_score"]}
+                                        for item in group["responses"].values()],
+            }
+            if progress_callback:
+                progress_callback({"type": "stage", "stage": "feedback_approved",
+                                   "detail": "The reframed answer passed evaluation against its current cited documentation."})
+            self._save_exchange(session_id, question, response["answer"], response, query_embedding)
+            log.info("feedback_shortcut_applied kind=upvoted_answer_reframed feedback_score=%s confidence=%s",
+                     feedback_score, confidence.get("overall"))
+            return response
+        return None
 
     def _generation(self, state: RAGState) -> dict[str, Any]:
         started = perf_counter()
@@ -563,12 +733,14 @@ class RAGService:
         docs = [{"document": d["document"], "section": d["section"], "chunk_id": d["chunk_id"], "text": d["text"]}
                 for d in state.get("relevant_documents", [])]
         try:
-            raw = self.model_client.generate(self.config.judge_model, EVALUATION_PROMPT.format(
+            prompt = EVALUATION_PROMPT.format(
                 question=state["original_query"],
                 standalone_query=state.get("standalone_query") or state["original_query"],
                 answer=state.get("answer", ""), documents=json.dumps(docs, ensure_ascii=False),
-            ), json_mode=True)
-            data = parse_structured_output(raw, AnswerEvaluationOutput)
+            )
+            data = self._generate_structured(self.config.judge_model,
+                                             self.config.judge_fallback_models,
+                                             prompt, AnswerEvaluationOutput)
             scores, reasons = {}, {}
             for dimension in ("faithfulness", "relevance", "correctness"):
                 item = getattr(data, dimension)
@@ -699,12 +871,12 @@ class RAGService:
                     return
                 if shortcut:
                     publish({"type": "stage", "stage": "feedback_shortcut",
-                             "detail": ("Using a version-checked, high-confidence upvoted answer; retrieval was skipped."
+                             "detail": ("Using a positively rated answer reframed and verified against current citations; document search was skipped."
                                         if shortcut["status"] == "passed" else
                                         "Similar low-confidence answers received repeated negative feedback; retrieval was skipped.")})
                     if shortcut.get("status") == "passed":
-                        for index in range(0, len(shortcut["answer"]), 32):
-                            publish({"type": "token", "text": shortcut["answer"][index:index + 32]})
+                        for character in shortcut["answer"]:
+                            publish({"type": "token", "text": character})
                     publish({"type": "result", "response": shortcut})
                     return
                 state = self._initial_state(question, session_id, document_ids=document_ids, top_k=top_k,
@@ -716,8 +888,8 @@ class RAGService:
                     return
                 response = self._format_response(result, session_id)
                 if response["status"] == "passed":
-                    for index in range(0, len(response["answer"]), 32):
-                        publish({"type": "token", "text": response["answer"][index:index + 32]})
+                    for character in response["answer"]:
+                        publish({"type": "token", "text": character})
                 publish({"type": "result", "response": response})
             except QueryCancelled:
                 log.info("query_stream_cancelled request_id=%s", request_id)

@@ -82,8 +82,10 @@ class AppStore:
     def recent_question_records(self, limit: int = 100) -> list[dict[str, Any]]:
         """Return recent distinct questions and any stored embedding."""
         rows = self.connection.execute(
-            """SELECT message.id, message.content, message.question_embedding
+            """SELECT message.id, message.content, message.question_embedding, assistant.metadata_json
                FROM conversation_messages AS message
+               LEFT JOIN conversation_messages AS assistant
+                 ON assistant.id=message.id+1 AND assistant.session_id=message.session_id AND assistant.role='assistant'
                JOIN (
                  SELECT MAX(id) AS latest_id FROM conversation_messages
                  WHERE role='user' AND TRIM(content) != ''
@@ -92,9 +94,13 @@ class AppStore:
                ORDER BY message.id DESC LIMIT ?""",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-        return [{"id": row["id"], "question": str(row["content"]),
-                 "question_embedding": json.loads(row["question_embedding"]) if row["question_embedding"] else None}
-                for row in rows]
+        records = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}")
+            records.append({"id": row["id"], "question": str(row["content"]),
+                            "question_embedding": json.loads(row["question_embedding"]) if row["question_embedding"] else None,
+                            "feedback_question": metadata.get("feedback_question")})
+        return records
 
     def store_question_embedding(self, message_id: int, embedding: list[float]) -> None:
         with self.connection:
@@ -133,10 +139,17 @@ class AppStore:
             return None
         return json.loads(row["metadata_json"])
 
-    def delete_session(self, session_id: str) -> None:
+    def delete_session(self, session_id: str) -> dict[str, int]:
+        messages = self.connection.execute(
+            "SELECT COUNT(*) FROM conversation_messages WHERE session_id=?", (session_id,)
+        ).fetchone()[0]
+        feedback = self.connection.execute(
+            "SELECT COUNT(*) FROM feedback WHERE session_id=?", (session_id,)
+        ).fetchone()[0]
         with self.connection:
             self.connection.execute("DELETE FROM conversation_messages WHERE session_id=?", (session_id,))
             self.connection.execute("DELETE FROM feedback WHERE session_id=?", (session_id,))
+        return {"messages_deleted": int(messages), "feedback_deleted": int(feedback)}
 
     def close(self) -> None:
         self.connection.close()
@@ -221,6 +234,49 @@ class AppStore:
         return {"feedback_id": saved["feedback_id"] if saved else feedback_id,
                 "status": "recorded" if not saved or saved["feedback_id"] == feedback_id else "updated",
                 "created_at": created_at}
+
+    def canonicalize_feedback_group(self, question: str, embedding: list[float], scope: list[str],
+                                    threshold: float = 0.72) -> int:
+        """Give semantically matching votes one stored question while preserving distinct answers."""
+        normalized = " ".join(question.casefold().split())
+        target_scope = sorted(scope)
+        entries = [entry for entry in self.feedback_entries(limit=2000)
+                   if entry.get("scope", []) == target_scope and entry.get("question_embedding")]
+        matching = []
+        for entry in entries:
+            candidate = entry["question_embedding"]
+            if len(candidate) != len(embedding) or not candidate:
+                continue
+            dot = sum(float(left) * float(right) for left, right in zip(embedding, candidate))
+            left_norm = sum(float(value) ** 2 for value in embedding) ** 0.5
+            right_norm = sum(float(value) ** 2 for value in candidate) ** 0.5
+            similarity = dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
+            if similarity >= threshold or " ".join(entry["question"].casefold().split()) == normalized:
+                matching.append(entry)
+
+        # The unique index is per voter and answer. Keep the latest vote if older
+        # versions stored the same answer under multiple paraphrased questions.
+        keep: dict[tuple[str, str], dict[str, Any]] = {}
+        for entry in matching:
+            if entry.get("session_id") and entry.get("answer_hash"):
+                key = (entry["session_id"], entry["answer_hash"])
+                current = keep.get(key)
+                if current is None or entry.get("created_at", "") > current.get("created_at", ""):
+                    keep[key] = entry
+        kept_ids = {entry["feedback_id"] for entry in keep.values()}
+        delete_ids = [entry["feedback_id"] for entry in matching
+                      if entry.get("session_id") and entry.get("answer_hash")
+                      and entry["feedback_id"] not in kept_ids]
+        with self.connection:
+            if delete_ids:
+                self.connection.executemany("DELETE FROM feedback WHERE feedback_id=?", [(item,) for item in delete_ids])
+            for feedback_id in kept_ids:
+                self.connection.execute(
+                    """UPDATE feedback SET question=?, normalized_question=?, question_embedding=?, scope_json=?
+                       WHERE feedback_id=?""",
+                    (question, normalized, json.dumps(embedding), json.dumps(target_scope), feedback_id),
+                )
+        return len(kept_ids)
 
     def feedback_entries(self, limit: int = 500) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT * FROM feedback ORDER BY created_at DESC, rowid DESC LIMIT ?",

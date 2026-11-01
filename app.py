@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -113,6 +113,8 @@ def create_app(rag_service: RAGService | None = None, ingestion_service: Ingesti
                                                   top_k=request.top_k, request_id=request_id):
                         event_name = event.pop("type")
                         yield f"event: {event_name}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                        if event_name == "token" and rag.config.stream_char_delay_ms:
+                            sleep(rag.config.stream_char_delay_ms / 1000)
 
                 return StreamingResponse(event_stream(), media_type="text/event-stream",
                                          headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -181,10 +183,37 @@ def create_app(rag_service: RAGService | None = None, ingestion_service: Ingesti
             log.exception("Could not list indexed documents")
             raise HTTPException(status_code=503, detail="Document metadata is temporarily unavailable") from exc
 
+    @app.delete("/documents")
+    def clear_documents():
+        try:
+            _, ingestion, _ = runtime(require_ingestion=True)
+            result = ingestion.delete_documents()
+            log.info("document_index_cleared documents=%s chunks=%s",
+                     result["deleted_documents"], result["deleted_chunks"])
+            return result
+        except Exception as exc:
+            log.exception("Could not clear indexed documents")
+            raise HTTPException(status_code=503, detail="The document index could not be cleared") from exc
+
+    @app.delete("/documents/{document_id:path}")
+    def delete_document(document_id: str):
+        try:
+            _, ingestion, _ = runtime(require_ingestion=True)
+            result = ingestion.delete_documents([document_id])
+            if result["deleted_documents"] == 0:
+                raise HTTPException(status_code=404, detail="Indexed document was not found")
+            log.info("document_deleted document_id=%s chunks=%s", document_id, result["deleted_chunks"])
+            return result
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.exception("Could not delete indexed document")
+            raise HTTPException(status_code=503, detail="The indexed document could not be deleted") from exc
+
     @app.post("/feedback")
     def feedback(request: FeedbackRequest):
         try:
-            rag, ingestion, store = runtime(require_ingestion=True, require_rag=True)
+            _, ingestion, store = runtime(require_ingestion=True)
             question = request.question.strip()
             verified = store.verified_exchange(request.session_id, question, request.answer)
             if not verified:
@@ -199,11 +228,16 @@ def create_app(rag_service: RAGService | None = None, ingestion_service: Ingesti
             vectors = ingestion.embedder.encode([feedback_question])
             if len(vectors) != 1:
                 raise RuntimeError("Could not encode question for semantic feedback matching")
-            canonical_question = rag.canonical_feedback_question(
-                feedback_question, request.rating, request.document_ids, vectors[0])
+            canonical_question = RAGService.find_canonical_feedback_question(
+                store, RetrievalConfig.from_env(), feedback_question, request.rating,
+                request.document_ids, vectors[0])
             canonical_vectors = ingestion.embedder.encode([canonical_question]) if canonical_question != feedback_question else vectors
             if len(canonical_vectors) != 1:
                 raise RuntimeError("Could not encode canonical feedback question")
+            store.canonicalize_feedback_group(
+                canonical_question, canonical_vectors[0], request.document_ids or [],
+                RetrievalConfig.from_env().feedback_positive_similarity_threshold,
+            )
             # Answer metadata comes from the server-side conversation record, not client-submitted source fields.
             result = store.save_feedback(
                 request.session_id, canonical_question, request.rating, request.comment,
@@ -224,9 +258,10 @@ def create_app(rag_service: RAGService | None = None, ingestion_service: Ingesti
     def delete_session(session_id: str):
         try:
             _, _, store = runtime()
-            store.delete_session(session_id)
-            log.info("conversation_deleted session_id=%s", session_id)
-            return {"status": "deleted", "session_id": session_id}
+            result = store.delete_session(session_id)
+            log.info("conversation_deleted session_id=%s messages=%s feedback=%s", session_id,
+                     result["messages_deleted"], result["feedback_deleted"])
+            return {"status": "deleted", "session_id": session_id, **result}
         except Exception as exc:
             log.exception("Could not delete conversation session")
             raise HTTPException(status_code=503, detail="Conversation could not be deleted") from exc

@@ -95,6 +95,10 @@ def test_updated_chunks_invalidate_dependent_feedback_and_conversation_memory(tm
                          answer="Original answer.", confidence={"overall": 40}, sources=sources,
                          question_embedding=[1.0, 0.0], corpus_fingerprint="old",
                          response_status="unverified")
+    memory.save_feedback("session-3", "How do I set this up?", "up", None,
+                         answer="Cached positive answer.", confidence={"overall": 90}, sources=sources,
+                         question_embedding=[1.0, 0.0], corpus_fingerprint="old",
+                         response_status="passed")
     memory.save_exchange("session-2", "Unrelated question", "Unrelated answer.", {
         "sources": [{"document_id": "other-doc", "chunk_id": "keep-chunk"}],
     })
@@ -108,3 +112,65 @@ def test_updated_chunks_invalidate_dependent_feedback_and_conversation_memory(tm
         {"role": "user", "content": "Unrelated question"},
         {"role": "assistant", "content": "Unrelated answer."},
     ]
+
+
+def test_delete_document_rebuilds_index_and_removes_citing_memory(tmp_path):
+    first_file = tmp_path / "first.md"
+    second_file = tmp_path / "second.md"
+    first_file.write_text("# First\n\nFirst indexed instructions.", encoding="utf-8")
+    second_file.write_text("# Second\n\nSecond indexed instructions.", encoding="utf-8")
+    service, _, indexer, metadata = make_service(tmp_path / "state")
+    memory = AppStore(tmp_path / "state" / "app.sqlite3")
+    service.memory_store = memory
+    first = service.ingest_file(first_file)
+    second = service.ingest_file(second_file)
+    first_chunk = metadata.get_chunks(first.document_id)[0]
+    second_chunk = metadata.get_chunks(second.document_id)[0]
+    first_doc = metadata.get_document(first.document_id)
+    first_source = {"document_id": first.document_id, "document_version": first_doc["version"],
+                    "chunk_id": first_chunk["chunk_id"], "chunk_hash": first_chunk["content_hash"]}
+    memory.save_exchange("session-1", "Question about first", "First answer.", {"sources": [first_source]})
+    memory.save_feedback("session-1", "Question about first", "up", None, answer="First answer.",
+                         sources=[first_source], question_embedding=[1.0, 0.0])
+    memory.save_exchange("session-2", "Question about second", "Second answer.", {
+        "sources": [{"document_id": second.document_id, "chunk_id": second_chunk["chunk_id"]}],
+    })
+
+    result = service.delete_documents([first.document_id])
+
+    assert result["deleted_documents"] == 1
+    assert result["deleted_chunks"] == 1
+    assert [doc["document_id"] for doc in metadata.list_documents()] == [second.document_id]
+    assert {chunk["vector_id"] for chunk in indexer.current} == {second_chunk["vector_id"]}
+    assert memory.history("session-1") == []
+    assert memory.feedback_entries() == []
+    assert len(memory.history("session-2")) == 2
+
+
+def test_document_delete_endpoints_remove_one_or_all_indexes(tmp_path):
+    from fastapi.testclient import TestClient
+    from urllib.parse import quote
+    from app import create_app
+
+    state = tmp_path / "state"
+    service, _, indexer, metadata = make_service(state)
+    memory = AppStore(state / "app.sqlite3")
+    client = TestClient(create_app(ingestion_service=service, app_store=memory))
+    first_file = tmp_path / "first.md"
+    first_file.write_text("# First\n\nFirst document.", encoding="utf-8")
+    first = service.ingest_file(first_file)
+
+    deleted = client.delete("/documents/" + quote(first.document_id, safe=""))
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted_documents"] == 1
+    assert metadata.list_documents() == []
+    assert indexer.current == []
+
+    second_file = tmp_path / "second.md"
+    second_file.write_text("# Second\n\nSecond document.", encoding="utf-8")
+    service.ingest_file(second_file)
+    cleared = client.delete("/documents")
+    assert cleared.status_code == 200
+    assert cleared.json()["deleted_documents"] == 1
+    assert metadata.list_documents() == []
+    assert indexer.current == []

@@ -44,6 +44,12 @@ class AnswerEvaluationOutput(StrictOutput):
     feedback: str
 
 
+class FeedbackAnswerOutput(StrictOutput):
+    can_answer: bool
+    answer: str
+    reason: str
+
+
 def parse_structured_output(text: str, schema: type[StrictOutput]) -> StrictOutput:
     try:
         return schema.model_validate(parse_json_response(text))

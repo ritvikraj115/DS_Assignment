@@ -65,19 +65,20 @@ export default function ChatMessage({ message, sessionId }) {
     <div className="assistant-avatar"><Bot size={17} /></div>
     <div className="assistant-content">
       <div className="assistant-name">DocuMind <span>Assistant</span></div>
-      {message.status === 'streaming' && message.progress?.length > 0 && (() => {
+      {message.progress?.length > 0 && (() => {
         const current = message.progress[message.progress.length - 1]
+        const inProgress = message.status === 'streaming'
         return <details className="pipeline-progress" aria-live="polite">
           <summary className="pipeline-summary">
-            <span className="pipeline-marker"><LoaderCircle size={11} className="spin" /></span>
-            <span className="pipeline-current"><strong>{current.label}</strong>{current.stage === 'memory_match' && current.detail && <small className="pipeline-memory-current">{current.detail}</small>}<small>{message.progress.length} steps · click to view progress</small></span>
+            <span className="pipeline-marker">{inProgress ? <LoaderCircle size={11} className="spin" /> : <Check size={11} />}</span>
+            <span className="pipeline-current"><strong>{inProgress ? current.label : 'Answer complete'}</strong>{inProgress && current.stage === 'memory_match' && current.detail && <small className="pipeline-memory-current">{current.detail}</small>}<small>{message.progress.length} steps · {inProgress ? 'click to view progress' : 'click to view completed steps'}</small></span>
           </summary>
           <div className="pipeline-history" aria-label="Answer pipeline progress">
             {message.progress.map((step, index) => <div className={`pipeline-step pipeline-${step.state}`} key={`${step.stage}-${index}`}>
-              <span className="pipeline-marker">{step.state === 'complete' ? <Check size={11} /> : <LoaderCircle size={11} className="spin" />}</span>
+              <span className="pipeline-marker">{step.state === 'complete' || !inProgress ? <Check size={11} /> : <LoaderCircle size={11} className="spin" />}</span>
               <span><strong>{step.label}</strong>{step.detail && <small>{step.detail}</small>}
                 {step.matches?.map((match, matchIndex) => <small className="memory-match" key={`${match.question}-${matchIndex}`}>
-                  “{match.question}” · {Math.round(match.similarity * 100)}% similar · {match.rating ? (match.rating === 'up' ? 'helpful' : 'not helpful') : 'no feedback yet'}
+                  “{match.question}” · {Math.round(match.similarity * 100)}% similar · {match.rating === 'up' ? 'positive feedback' : match.rating === 'down' ? 'negative feedback' : match.rating === 'mixed' ? 'mixed feedback' : 'no feedback yet'}{match.response_count ? ` · ${match.response_count} saved answer${match.response_count === 1 ? '' : 's'}` : ''}
                 </small>)}
               </span>
             </div>)}

@@ -14,6 +14,7 @@ class RetrievalConfig:
     gemini_timeout_ms: int = 30000
     top_k: int = 5
     max_retrieval_retries: int = 2
+    stream_char_delay_ms: int = 12
     minimum_dimension_score: int = 70
     minimum_overall_score: int = 75
     max_history_turns: int = 8
@@ -36,6 +37,7 @@ class RetrievalConfig:
             gemini_timeout_ms=int(os.getenv("GEMINI_TIMEOUT_MS", "30000")),
             top_k=int(os.getenv("RETRIEVAL_TOP_K", "5")),
             max_retrieval_retries=int(os.getenv("MAX_RETRIEVAL_RETRIES", "2")),
+            stream_char_delay_ms=int(os.getenv("STREAM_CHAR_DELAY_MS", "12")),
             minimum_dimension_score=int(os.getenv("MINIMUM_DIMENSION_SCORE", "70")),
             minimum_overall_score=int(os.getenv("MINIMUM_OVERALL_SCORE", "75")),
             max_history_turns=int(os.getenv("MAX_HISTORY_TURNS", "8")),
@@ -50,6 +52,8 @@ class RetrievalConfig:
             raise ValueError("GEMINI_TIMEOUT_MS must be positive")
         if not 0 <= self.max_retrieval_retries <= 2:
             raise ValueError("MAX_RETRIEVAL_RETRIES must be between 0 and 2")
+        if not 0 <= self.stream_char_delay_ms <= 100:
+            raise ValueError("STREAM_CHAR_DELAY_MS must be between 0 and 100")
         if not 0 <= self.minimum_dimension_score <= 100 or not 0 <= self.minimum_overall_score <= 100:
             raise ValueError("Evaluation thresholds must be between 0 and 100")
         if not 0.0 <= self.feedback_positive_similarity_threshold <= 1.0:

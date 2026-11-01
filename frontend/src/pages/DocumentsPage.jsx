@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ArrowDownToLine, Check, CircleAlert, FileCode2, FileText, Globe2, LoaderCircle, RefreshCw, UploadCloud, X } from 'lucide-react'
-import { fetchDocuments, friendlyError, ingestFile, ingestUrl } from '../services/api.js'
+import { ArrowDownToLine, Check, CircleAlert, FileCode2, FileText, Globe2, LoaderCircle, RefreshCw, Trash2, UploadCloud, X } from 'lucide-react'
+import { clearDocuments, deleteDocument, fetchDocuments, friendlyError, ingestFile, ingestUrl } from '../services/api.js'
 
 const allowedExtensions = ['.pdf', '.docx', '.pptx', '.xlsx', '.csv', '.json', '.md', '.markdown', '.txt', '.html', '.htm']
 const statusCopy = {
@@ -21,6 +21,7 @@ export default function DocumentsPage() {
   const [pageError, setPageError] = useState('')
   const [notice, setNotice] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(null)
   const [url, setUrl] = useState('')
   const [dragging, setDragging] = useState(false)
@@ -81,6 +82,34 @@ export default function DocumentsPage() {
     }
   }
 
+  async function removeDocument(document) {
+    if (!window.confirm(`Remove ${document.filename} from the index? Feedback and chat answers citing its chunks will also be deleted.`)) return
+    setDeleting(true)
+    try {
+      const result = await deleteDocument(document.document_id)
+      setNotice({ type: 'success', text: `Removed ${document.filename} and ${result.deleted_chunks} indexed chunks.` })
+      await refresh()
+    } catch (error) {
+      setNotice({ type: 'error', text: friendlyError(error) })
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  async function clearIndex() {
+    if (!window.confirm(`Delete all ${documents.length} indexed documents and their vectors? Feedback and chat answers citing these documents will also be deleted.`)) return
+    setDeleting(true)
+    try {
+      const result = await clearDocuments()
+      setNotice({ type: 'success', text: `Cleared ${result.deleted_documents} documents and ${result.deleted_chunks} indexed chunks.` })
+      await refresh()
+    } catch (error) {
+      setNotice({ type: 'error', text: friendlyError(error) })
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   function onDrop(event) {
     event.preventDefault()
     setDragging(false)
@@ -118,14 +147,15 @@ export default function DocumentsPage() {
     {pageError && <div className="inline-error"><CircleAlert size={16} />{pageError}<button onClick={refresh}>Try again</button></div>}
 
     <section className="library-section">
-      <div className="library-heading"><div><h2>Indexed documents</h2><p>Documents available to the assistant.</p></div><span className="document-count">{documents.length} {documents.length === 1 ? 'document' : 'documents'}</span></div>
+      <div className="library-heading"><div><h2>Indexed documents</h2><p>Documents available to the assistant.</p></div><div className="library-actions"><span className="document-count">{documents.length} {documents.length === 1 ? 'document' : 'documents'}</span>{documents.length > 0 && <button className="clear-index-button" onClick={clearIndex} disabled={deleting || busy}><Trash2 size={13} /> Clear index</button>}</div></div>
       <div className="documents-table-wrap">
-        <table className="documents-table"><thead><tr><th>DOCUMENT</th><th>SOURCE</th><th>VERSION</th><th>CHUNKS</th><th>STATUS</th><th>UPDATED</th></tr></thead>
-          <tbody>{loading ? <tr><td colSpan="6"><div className="table-loading"><LoaderCircle size={17} className="spin" /> Loading documents…</div></td></tr> : documents.length === 0 ? <tr><td colSpan="6"><div className="table-empty"><div className="empty-file-icon"><FileCode2 size={20} /></div><strong>Your knowledge base is empty</strong><span>Upload a document or import a URL to get started.</span></div></td></tr> : documents.map((doc) => <tr key={doc.document_id}>
+        <table className="documents-table"><thead><tr><th>DOCUMENT</th><th>SOURCE</th><th>VERSION</th><th>CHUNKS</th><th>STATUS</th><th>UPDATED</th><th></th></tr></thead>
+          <tbody>{loading ? <tr><td colSpan="7"><div className="table-loading"><LoaderCircle size={17} className="spin" /> Loading documents…</div></td></tr> : documents.length === 0 ? <tr><td colSpan="7"><div className="table-empty"><div className="empty-file-icon"><FileCode2 size={20} /></div><strong>Your knowledge base is empty</strong><span>Upload a document or import a URL to get started.</span></div></td></tr> : documents.map((doc) => <tr key={doc.document_id}>
             <td><div className="document-name-cell"><div className="document-type-icon"><FileText size={16} /></div><div><strong>{doc.filename}</strong><small>{doc.document_id}</small></div></div></td>
             <td><span className="source-cell" title={doc.source_url || 'Local upload'}>{doc.source_url ? <><Globe2 size={13} />{doc.source_url}</> : 'Local upload'}</span></td>
             <td><span className="version-pill">v{doc.version}</span></td><td>{doc.chunk_count}</td>
             <td><span className="table-status status-success"><span />Indexed</span></td><td>{formatDate(doc.updated_at)}</td>
+            <td><button className="document-delete-button" aria-label={`Delete ${doc.filename} from index`} title="Delete from index" onClick={() => removeDocument(doc)} disabled={deleting || busy}><Trash2 size={14} /></button></td>
           </tr>)}</tbody>
         </table>
       </div>

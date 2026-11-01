@@ -55,6 +55,57 @@ class IngestionService:
         parsed = parse_url(url, self.config.request_timeout)
         return self._ingest(parsed, document_id or self._url_id(url))
 
+    def delete_documents(self, document_ids: list[str] | None = None) -> dict:
+        """Remove selected documents and atomically promote an index without their vectors."""
+        documents = self.metadata.list_documents()
+        selected = set(document_ids) if document_ids is not None else {doc["document_id"] for doc in documents}
+        removed_documents = [doc for doc in documents if doc["document_id"] in selected]
+        if not removed_documents:
+            return {"status": "deleted", "deleted_documents": 0, "deleted_chunks": 0}
+
+        removed_ids = {doc["document_id"] for doc in removed_documents}
+        existing_chunks = self.metadata.get_chunks()
+        removed_chunks = [chunk for chunk in existing_chunks if chunk["document_id"] in removed_ids]
+        remaining_chunks = [chunk for chunk in existing_chunks if chunk["document_id"] not in removed_ids]
+        staged = self.indexer.prepare(remaining_chunks)
+        try:
+            for document in removed_documents:
+                self.metadata.delete_document(document["document_id"])
+            self.indexer.promote(staged)
+        except Exception:
+            log.exception("document_delete_commit_failed document_ids=%s", sorted(removed_ids))
+            if staged is not None and staged.exists():
+                staged.unlink(missing_ok=True)
+            for document in removed_documents:
+                prior_chunks = [Chunk(chunk["chunk_id"], chunk["text"], chunk["section"], chunk["content_hash"],
+                                      chunk["vector_id"], chunk["embedding"], chunk.get("created_at", document["updated_at"]),
+                                      chunk.get("updated_at", document["updated_at"]))
+                                for chunk in removed_chunks if chunk["document_id"] == document["document_id"]]
+                try:
+                    self.metadata.replace_document(document, prior_chunks)
+                except Exception:
+                    log.exception("document_delete_metadata_rollback_failed document_id=%s", document["document_id"])
+            try:
+                self.indexer.rebuild(existing_chunks)
+            except Exception:
+                log.exception("document_delete_index_rollback_failed")
+            raise
+
+        if self.memory_store:
+            for document in removed_documents:
+                chunk_ids = {chunk["chunk_id"] for chunk in removed_chunks
+                             if chunk["document_id"] == document["document_id"]}
+                try:
+                    invalidated = self.memory_store.invalidate_chunk_memory(document["document_id"], chunk_ids)
+                    log.info("document_delete_memory_invalidated document_id=%s feedback=%s exchanges=%s",
+                             document["document_id"], invalidated["feedback"], invalidated["exchanges"])
+                except Exception:
+                    log.exception("Could not invalidate memory for deleted document_id=%s", document["document_id"])
+
+        log.info("documents_deleted count=%s chunks=%s", len(removed_documents), len(removed_chunks))
+        return {"status": "deleted", "deleted_documents": len(removed_documents),
+                "deleted_chunks": len(removed_chunks), "document_ids": sorted(removed_ids)}
+
     def _ingest(self, parsed, document_id: str) -> IngestionResult:
         started = perf_counter()
         log.info("ingestion_started document_id=%s filename=%s source_url=%s", document_id, parsed.filename, bool(parsed.source_url))

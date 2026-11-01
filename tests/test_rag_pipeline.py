@@ -114,6 +114,10 @@ class ScriptedModel:
                                {"chunk_id": chunk["chunk_id"], "relevant": is_relevant.get(chunk["chunk_id"], False),
                                 "reason": "Relevant documentation." if is_relevant.get(chunk["chunk_id"], False) else "Different topic."}
                                for chunk in question_chunks]})
+        if prompt.startswith("Decide whether the current question"):
+            return json.dumps({"can_answer": True,
+                               "answer": "Use Depends() to declare dependencies.",
+                               "reason": "The current cited documentation supports this answer."})
         if prompt.startswith("Answer"):
             return self.answers.pop(0) if self.answers else "Corrected answer. [S1]"
         if prompt.startswith("Evaluate"):
@@ -156,6 +160,28 @@ def test_relevant_retrieval_generation_evaluation_and_real_citations():
     assert result["sources"][0]["chunk_id"] == "chunk_001"
     assert "test-generation" in [call[0] for call in model.calls]
     assert "test-judge" in [call[0] for call in model.calls]
+
+
+def test_structured_judge_schema_failure_uses_configured_fallback_model():
+    class InvalidPrimaryThenValidFallback(ScriptedModel):
+        def generate(self, model, prompt, *, json_mode=False):
+            self.calls.append((model, prompt, json_mode))
+            if model == "test-judge":
+                return json.dumps({"grades": [{"chunk_id": "chunk_001", "relevant": "yes", "reason": "Relevant."}]})
+            return json.dumps({"grades": [{"chunk_id": "chunk_001", "relevant": True, "reason": "Relevant."}]})
+
+    rag, model, _ = make_rag(InvalidPrimaryThenValidFallback())
+    rag.config = RetrievalConfig(generation_model="test-generation", judge_model="test-judge",
+                                 judge_fallback_models=("test-judge-lite",), top_k=5)
+    result = rag._document_grading({
+        "standalone_query": "How does FastAPI declare dependencies?",
+        "retrieved_documents": [{"chunk_id": "chunk_001", "document": "fastapi.md",
+                                  "section": "Dependency Injection", "text": "FastAPI uses Depends()."}],
+    })
+
+    assert result["error"] is None
+    assert result["relevant_documents"][0]["chunk_id"] == "chunk_001"
+    assert [call[0] for call in model.calls] == ["test-judge", "test-judge-lite"]
 
 
 def test_irrelevant_first_retrieval_rewrites_and_succeeds():
@@ -309,7 +335,7 @@ def test_feedback_is_stored_separately(tmp_path):
 def test_prior_question_memory_is_checked_without_feedback(tmp_path):
     store = AppStore(tmp_path / "app.sqlite3")
     store.save_exchange("session-1", "How does FastAPI declare dependencies?", "They use Depends.")
-    rag, _, _ = make_rag(app_store=store)
+    rag, model, _ = make_rag(app_store=store)
     events = []
 
     result = rag._feedback_shortcut(
@@ -326,6 +352,24 @@ def test_prior_question_memory_is_checked_without_feedback(tmp_path):
     embedded_count = len(rag.ingestion.embedder.queries)
     rag._feedback_shortcut("How does FastAPI declare dependencies?", "session-3", None)
     assert len(rag.ingestion.embedder.queries) == embedded_count + 1
+
+
+def test_similar_history_question_shows_its_feedback_rating(tmp_path):
+    store = AppStore(tmp_path / "app.sqlite3")
+    store.save_exchange("session-1", "Explain backoff behaviour in requests", "Use exponential backoff.",
+                        {"feedback_question": "How does retry backoff work?"}, question_embedding=[1.0, 0.0])
+    store.save_feedback("session-2", "How does retry backoff work?", "up", None,
+                        answer="Use exponential backoff.", question_embedding=[0.0, 1.0])
+    rag, _, _ = make_rag(app_store=store)
+    events = []
+
+    result = rag._feedback_shortcut("explain backoff behaviour in requests", "session-3", None,
+                                    progress_callback=events.append)
+
+    assert result is None
+    match_event = next(event for event in events if event["stage"] == "memory_match")
+    assert match_event["matches"][0]["rating"] == "up"
+    assert match_event["matches"][0]["response_count"] == 1
 
 
 def test_feedback_submission_updates_existing_vote_instead_of_counting_twice(tmp_path):
@@ -400,7 +444,7 @@ def test_feedback_answer_cache_is_rejected_when_source_chunk_changes(tmp_path):
 
 def test_feedback_shortcut_needs_one_confident_positive_and_keeps_response_array(tmp_path):
     store = AppStore(tmp_path / "app.sqlite3")
-    rag, _, _ = make_rag(app_store=store)
+    rag, model, _ = make_rag(app_store=store)
     question = "How does FastAPI declare dependencies?"
     fingerprint = rag._feedback_corpus_fingerprint(DOCUMENTS[:1])
     sources = [{"document": "fastapi_dependencies.md", "section": "Dependency Injection",
@@ -414,8 +458,52 @@ def test_feedback_shortcut_needs_one_confident_positive_and_keeps_response_array
     result = rag._feedback_shortcut(question, "query-session", None)
 
     assert result["feedback_shortcut"] == "upvoted_answer"
-    assert result["feedback_score"] == 1
+    assert result["feedback_score"] == 2
     assert len(result["feedback_responses"]) == 2
+    feedback_prompt = next(prompt for _, prompt, _ in model.calls
+                           if prompt.startswith("Decide whether the current question"))
+    assert "Use Depends() for dependencies." in feedback_prompt
+    assert "Declare Depends() in a route." in feedback_prompt
+
+
+def test_feedback_answer_decline_is_shown_then_normal_retrieval_runs(tmp_path):
+    class DeclineFeedbackModel(ScriptedModel):
+        def generate(self, model, prompt, *, json_mode=False):
+            if prompt.startswith("Decide whether the current question"):
+                self.calls.append((model, prompt, json_mode))
+                return json.dumps({"can_answer": False, "answer": "",
+                                   "reason": "The prior answer does not resolve this wording."})
+            return super().generate(model, prompt, json_mode=json_mode)
+
+    store = AppStore(tmp_path / "app.sqlite3")
+    rag, model, _ = make_rag(DeclineFeedbackModel(), app_store=store)
+    question = "How does FastAPI declare dependencies?"
+    store.save_feedback("voter-1", question, "up", None, answer="Use Depends().",
+                        sources=[{"document": "fastapi_dependencies.md", "section": "Dependency Injection",
+                                  "chunk_id": "chunk_001", "document_id": "doc-1",
+                                  "document_version": 1, "chunk_hash": "a"}],
+                        confidence={"overall": 90},
+                        corpus_fingerprint=rag._feedback_corpus_fingerprint(DOCUMENTS[:1]),
+                        response_status="passed", question_embedding=[1.0, 0.0])
+
+    events = list(rag.query_stream(question, "new-session"))
+    stages = [event.get("stage") for event in events if event.get("type") == "stage"]
+
+    assert "feedback_review" in stages
+    assert "feedback_rejected" in stages
+    assert stages.index("feedback_rejected") < stages.index("retrieval")
+    assert any(prompt.startswith("Rewrite") for _, prompt, _ in model.calls)
+
+
+def test_retrieval_retry_is_visible_in_stream_steps():
+    model = ScriptedModel(grades=[False, True])
+    rag, _, _ = make_rag(model)
+
+    events = list(rag.query_stream("What is a FastAPI dependency?", "session-1"))
+    stages = [event.get("stage") for event in events if event.get("type") == "stage"]
+
+    assert "retrieval_retry" in stages
+    assert stages.index("retrieval_retry") < stages.index("retrieval", stages.index("retrieval_retry"))
 
 
 def test_negative_feedback_requires_net_below_minus_one_and_low_confidence(tmp_path):
@@ -464,7 +552,27 @@ def test_positive_and_negative_feedback_use_their_own_similarity_cutoffs(tmp_pat
     negative_match = rag.canonical_feedback_question("Similar follow-up", "down", None, [1.0, 0.0])
 
     assert positive_match == "How do I declare dependencies?"
-    assert negative_match == "Similar follow-up"
+    assert negative_match == "How do I declare dependencies?"
+
+
+def test_semantic_feedback_variants_are_persisted_under_one_canonical_question(tmp_path):
+    store = AppStore(tmp_path / "app.sqlite3")
+    store.save_feedback("voter-1", "How does retry backoff work?", "up", None,
+                        answer="Use exponential backoff.", question_embedding=[1.0, 0.0])
+    store.save_feedback("voter-1", "Explain backoff behaviour in requests", "down", None,
+                        answer="Use exponential backoff.", question_embedding=[1.0, 0.0])
+    store.save_feedback("voter-1", "How does backoff work?", "up", None,
+                        answer="Retry with an increasing delay.", question_embedding=[1.0, 0.0])
+
+    merged = store.canonicalize_feedback_group("How does retry backoff work?", [1.0, 0.0], [], 0.72)
+    entries = store.feedback_entries()
+
+    assert merged == 2
+    assert len(entries) == 2
+    assert {entry["question"] for entry in entries} == {"How does retry backoff work?"}
+    votes_by_answer = {entry["answer"]: entry["rating"] for entry in entries}
+    assert votes_by_answer == {"Use exponential backoff.": "down",
+                               "Retry with an increasing delay.": "up"}
 
 
 def test_followup_feedback_is_saved_under_resolved_question(tmp_path):
@@ -603,6 +711,7 @@ def test_fastapi_sse_streams_only_approved_answer_text(tmp_path):
     assert parsed[-1][0] == "result"
     assert parsed[-1][1]["response"]["status"] == "passed"
     assert all(name != "draft_token" for name, _ in parsed)
+    assert all(len(data.get("text", "")) == 1 for name, data in parsed if name == "token")
     approved = next(index for index, (name, data) in enumerate(parsed)
                     if name == "stage" and data.get("stage") == "approved")
     token_positions = [index for index, (name, _) in enumerate(parsed) if name == "token"]
@@ -634,3 +743,47 @@ def test_fastapi_health_query_documents_and_feedback_endpoints(tmp_path):
     assert feedback_response.status_code == 200
     assert feedback_response.json()["status"] == "recorded"
     assert len(store.history("api-session")) == 2
+
+
+def test_feedback_endpoint_does_not_require_a_generation_model(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import create_app
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    store = AppStore(tmp_path / "app.sqlite3")
+    _, _, ingestion = make_rag()
+    store.save_exchange("feedback-session", "Try that again", "Verified answer.", {
+        "feedback_question": "How do I declare FastAPI dependencies?",
+        "confidence": {"overall": 90, "status": "passed"}, "sources": [], "status": "passed",
+    })
+    client = TestClient(create_app(ingestion_service=ingestion, app_store=store))
+
+    response = client.post("/feedback", json={
+        "question": "Try that again", "rating": "up", "session_id": "feedback-session",
+        "answer": "Verified answer.",
+    })
+
+    assert response.status_code == 200
+    assert store.feedback_entries()[0]["question"] == "How do I declare FastAPI dependencies?"
+
+
+def test_deleting_chat_clears_its_feedback_and_conversation_memory(tmp_path):
+    from fastapi.testclient import TestClient
+    from app import create_app
+
+    store = AppStore(tmp_path / "app.sqlite3")
+    store.save_exchange("chat-to-delete", "Question to forget", "Answer to forget.")
+    store.save_feedback("chat-to-delete", "Question to forget", "up", None,
+                        answer="Answer to forget.", question_embedding=[1.0, 0.0])
+    store.save_exchange("other-chat", "Question to keep", "Answer to keep.")
+    client = TestClient(create_app(app_store=store))
+
+    response = client.delete("/sessions/chat-to-delete")
+
+    assert response.status_code == 200
+    assert response.json()["messages_deleted"] == 2
+    assert response.json()["feedback_deleted"] == 1
+    assert store.history("chat-to-delete") == []
+    assert store.feedback_entries() == []
+    assert len(store.history("other-chat")) == 2

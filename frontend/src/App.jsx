@@ -102,7 +102,7 @@ export default function App() {
       setError('Wait for the current answer to finish before deleting this conversation.')
       return
     }
-    if (!window.confirm(`Delete “${chat.title || 'this conversation'}” and its stored history?`)) return
+    if (!window.confirm(`Delete “${chat.title || 'this conversation'}”, its conversation memory, and its feedback?`)) return
     try {
       await deleteConversation(id)
       setChats((current) => current.filter((item) => item.id !== id))
@@ -160,7 +160,10 @@ export default function App() {
         messages: current.messages.map((message) => message.id !== assistantId ? message : {
           ...message, content: response.answer || 'The assistant returned an empty answer.', status: response.status,
           confidence: response.confidence, sources: response.sources || [],
-          progress: [],
+          progress: [...(message.progress || []).map((step) => ({ ...step, state: 'complete' })),
+            { stage: 'completed', label: 'Answer complete',
+              detail: response.status === 'passed' ? 'The answer passed verification and streamed to the chat.' : 'The response is ready.',
+              state: 'complete' }],
         }),
         updatedAt: Date.now(),
       }))
