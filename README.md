@@ -30,7 +30,7 @@ cd ..
 
 ## Start the app locally
 
-Use two PowerShell terminals from the project root.
+If you want to query the included FastAPI corpus, load it first using the command in **Included example corpus** below. Run ingestion before starting the API; if it was already running, restart it after ingestion so it reloads FAISS. Then use two PowerShell terminals from the project root.
 
 **Terminal 1 - backend:**
 
@@ -52,14 +52,31 @@ The first ingestion or query loads the configured local Sentence Transformer mod
 
 ## Included example corpus
 
-The repository includes a four-page public FastAPI documentation corpus in [`corpus/sources.json`](corpus/sources.json). Fetch and index it after starting the backend dependencies:
+The repository includes four public FastAPI documentation pages listed in [`corpus/sources.json`](corpus/sources.json). Load them before starting the API so its in-memory FAISS index starts with the new vectors:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python scripts/ingest_corpus.py
 ```
 
-The script uses the existing `IngestionService` and stable source IDs; running it again skips unchanged pages. It does not need a Gemini key, but it does need network access to the listed documentation pages and the local embedding model.
+The script fetches, chunks, embeds, and indexes the four pages using stable source IDs. It does not need a Gemini key, but it does need network access to the documentation pages and the local embedding model. It is safe to run again: unchanged pages report `already_indexed`. If the API was already running when you ran the script, restart it so FAISS reloads the updated index.
+
+After starting the backend, confirm the corpus is loaded:
+
+```powershell
+curl.exe http://127.0.0.1:8000/documents
+```
+
+Then send a question through the same streaming `/query` route used by the frontend:
+
+```powershell
+curl.exe -N -X POST http://127.0.0.1:8000/query `
+  -H "Content-Type: application/json" `
+  -H "Accept: text/event-stream" `
+  -d '{"question":"How do I declare a dependency in FastAPI?","session_id":"demo-session","stream":true}'
+```
+
+The response shows pipeline progress first, followed by the verified answer as it streams.
 
 ## End-to-end smoke check
 
